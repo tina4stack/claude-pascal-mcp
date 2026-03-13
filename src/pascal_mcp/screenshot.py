@@ -192,14 +192,13 @@ def _capture_with_printwindow(hwnd: int) -> Image.Image | None:
                 # Handle DPI-unaware windows on high-DPI monitors.
                 # PrintWindow renders at the window's internal DPI, but
                 # GetWindowRect returns physical pixels, leaving black areas.
-                # Detect and crop to actual content size.
+                # Detect and crop to actual content size, then fill edge remnants.
+                dpi_cropped = False
                 try:
                     GetDpiForWindow = ctypes.windll.user32.GetDpiForWindow
                     GetDpiForWindow.restype = ctypes.c_uint
                     window_dpi = GetDpiForWindow(hwnd)
-                    if window_dpi and window_dpi < 144:
-                        # Check monitor DPI
-                        from ctypes import wintypes
+                    if window_dpi:
                         monitor = ctypes.windll.user32.MonitorFromWindow(
                             hwnd, 2)  # MONITOR_DEFAULTTONEAREST
                         if monitor:
@@ -209,32 +208,32 @@ def _capture_with_printwindow(hwnd: int) -> Image.Image | None:
                                 monitor, 0,  # MDT_EFFECTIVE_DPI
                                 ctypes.byref(dpi_x), ctypes.byref(dpi_y))
                             if hr2 == 0 and dpi_x.value > window_dpi:
-                                # Window is DPI-unaware, crop to internal size
                                 scale = window_dpi / dpi_x.value
                                 iw, ih = img.size
                                 new_w = int(iw * scale)
                                 new_h = int(ih * scale)
                                 if new_w < iw or new_h < ih:
                                     img = img.crop((0, 0, new_w, new_h))
+                                    dpi_cropped = True
                 except Exception:
                     pass
 
-                # Fill any remaining near-black edge pixels with the
-                # window background color (handles DWM shadow remnants).
-                from PIL import ImageChops
-                iw, ih = img.size
-                bg_color = img.getpixel((iw // 2, ih // 2))
-                if all(c <= 30 for c in bg_color[:3]):
-                    bg_color = (240, 240, 240)
-                r_ch, g_ch, b_ch = img.split()
-                dark_limit = 30
-                r_mask = r_ch.point(lambda p: 255 if p <= dark_limit else 0)
-                g_mask = g_ch.point(lambda p: 255 if p <= dark_limit else 0)
-                b_mask = b_ch.point(lambda p: 255 if p <= dark_limit else 0)
-                dark_mask = ImageChops.multiply(
-                    ImageChops.multiply(r_mask, g_mask), b_mask)
-                bg_img = Image.new(img.mode, img.size, bg_color)
-                img = Image.composite(bg_img, img, dark_mask)
+                # Only fill edge dark pixels if we did a DPI crop
+                # (to clean up the remaining shadow border).
+                if dpi_cropped:
+                    iw, ih = img.size
+                    bg_color = img.getpixel((iw // 2, ih // 2))
+                    if all(c <= 30 for c in bg_color[:3]):
+                        bg_color = (240, 240, 240)
+                    edge = 6
+                    pixels = img.load()
+                    dark_limit = 30
+                    for y in range(ih):
+                        for x in range(iw):
+                            if x < edge or x >= iw - edge or y < edge or y >= ih - edge:
+                                p = pixels[x, y]
+                                if p[0] <= dark_limit and p[1] <= dark_limit and p[2] <= dark_limit:
+                                    pixels[x, y] = bg_color
 
                 return img
 
