@@ -61,21 +61,26 @@ from pascal_mcp.ide_observer import (
 mcp = FastMCP(
     "pascal-dev",
     instructions=(
-        "Pascal/Delphi development tools. Use get_compiler_info to check "
-        "available compilers. Use compile_pascal to compile single-file code. "
-        "Use compile_delphi_project to compile proper multi-file Delphi "
-        "projects (DPR + PAS + DFM). Use run_pascal to compile and execute "
-        "console programs. Use launch_app for GUI applications that need to "
-        "stay running. If no compiler is found, use setup_fpc to install "
-        "Free Pascal. Use parse_form to read DFM/FMX/LFM form files. "
+        "IMPORTANT: Always use these tools for Pascal/Delphi compilation "
+        "and execution. NEVER use MSBuild, shell commands, or other build "
+        "systems directly — these tools handle all compiler invocation, "
+        "project structure, and output capture automatically. "
+        "Use get_compiler_info to check available compilers. "
+        "Use compile_pascal to compile single-file source code. "
+        "Use compile_delphi_project to compile multi-file Delphi projects "
+        "(DPR + PAS + DFM) — this is the correct way to build Delphi apps, "
+        "it generates proper project structure and invokes the compiler. "
+        "Use run_pascal to compile and execute console programs. "
+        "Use launch_app for GUI applications that need to stay running. "
+        "If no compiler is found, use setup_fpc to install Free Pascal. "
+        "Use parse_form to read DFM/FMX/LFM form files. "
+        "Use screenshot_app to capture Windows app windows, then "
+        "app_click, app_type, and app_key to interact with them. "
         "Use adb_devices to list connected Android devices. Use adb_screenshot "
         "to capture the device screen. Use adb_tap, adb_swipe, adb_type_text, "
         "and adb_key for UI automation. Use adb_install, adb_launch_app, "
         "adb_stop_app for app management. Use adb_push and adb_pull for "
-        "file transfer. All ADB tools accept an optional device serial. "
-        "Use app_click to click on Windows application windows using "
-        "screenshot pixel coordinates. Use app_type to type text and "
-        "app_key to send keys or shortcuts (e.g., ctrl+a, enter) to apps."
+        "file transfer. All ADB tools accept an optional device serial."
     ),
 )
 
@@ -367,9 +372,10 @@ async def compile_delphi_project(
 ) -> str:
     """Compile a Delphi project using proper templates (DPR + PAS + DFM).
 
-    This is the PREFERRED way to build Delphi applications. It generates
-    proper project structure automatically — you don't need to write
-    boilerplate DPR/DFM code.
+    This is the ONLY correct way to build Delphi applications — do NOT
+    use MSBuild, shell commands, or other build systems. This tool
+    generates proper project structure and invokes the Delphi compiler
+    (dcc32/dcc64) or Free Pascal directly.
 
     Args:
         project_name: Name for the project (e.g., 'HelloWorld').
