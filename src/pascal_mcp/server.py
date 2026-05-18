@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
 from pascal_mcp.compiler import (
+    build_existing_dproj,
     cleanup_compile_result,
     compile_and_launch,
     compile_project,
@@ -67,9 +68,11 @@ mcp = FastMCP(
         "project structure, and output capture automatically. "
         "Use get_compiler_info to check available compilers. "
         "Use compile_pascal to compile single-file source code. "
-        "Use compile_delphi_project to compile multi-file Delphi projects "
-        "(DPR + PAS + DFM) — this is the correct way to build Delphi apps, "
-        "it generates proper project structure and invokes the compiler. "
+        "Use build_dproj to build an EXISTING .dproj file (multi-unit, "
+        "real Delphi project with its own search paths, defines, resources). "
+        "Use compile_delphi_project ONLY to GENERATE a new throwaway project "
+        "from a template (TButton/TEdit/TLabel/TMemo) — it cannot build "
+        "an existing .dproj. "
         "Use run_pascal to compile and execute console programs. "
         "Use launch_app for GUI applications that need to stay running. "
         "If no compiler is found, use setup_fpc to install Free Pascal. "
@@ -451,6 +454,73 @@ async def compile_delphi_project(
 
     if not output_dir and result.exe_path:
         parts.append("\nNote: Files are in a temp directory. Use output_dir to save permanently.")
+
+    return "\n".join(parts)
+
+
+@mcp.tool()
+async def build_dproj(
+    dproj_path: str,
+    config: str = "Debug",
+    platform: str = "Win32",
+    target: str = "Build",
+    studio_root: str | None = None,
+    timeout: int = 600,
+) -> str:
+    """Build an existing Delphi .dproj project file using MSBuild + rsvars.bat.
+
+    Use this for real-world multi-file Delphi projects (CuttlefishV2.dproj,
+    etc.) — anything that already exists on disk with its own .dproj, .dpr,
+    units, forms, search paths, conditional defines, and resources.
+    Honours the project's full build configuration exactly as RAD Studio
+    would, no template substitution.
+
+    NOTE: compile_delphi_project is for *generating* a new throwaway project
+    from a TButton/TEdit/TLabel/TMemo template. build_dproj is for building
+    an existing real project. Use the right one.
+
+    Args:
+        dproj_path: Absolute path to the .dproj file
+            (e.g. r"D:\\projects\\cuttlefishmobile\\src\\CuttlefishV2.dproj").
+        config: Build config — Debug, Release, etc. (default Debug).
+        platform: Target platform — Win32, Win64, Android64, iOSDevice64, OSX64
+            (default Win32). For Cuttlefish always use Win32 unless explicitly
+            building the Android APK.
+        target: MSBuild target — Build (default), Rebuild (clean+build), or Clean.
+        studio_root: Optional Studio install (e.g. r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0").
+            Defaults to the highest-version install detected.
+        timeout: Seconds before the build is killed (default 600).
+    """
+    result = build_existing_dproj(
+        dproj_path=dproj_path,
+        config=config,
+        platform=platform,
+        target=target,
+        studio_root=studio_root,
+        timeout=timeout,
+    )
+
+    parts = [
+        f"Project: {dproj_path}",
+        f"Compiler: {result.compiler_used}",
+        f"Target/Config/Platform: {target} / {config} / {platform}",
+        f"Exit code: {result.exit_code}",
+        f"Success: {result.success}",
+    ]
+    if result.exe_path:
+        parts.append(f"Executable: {result.exe_path}")
+
+    # Trim noisy MSBuild output to the interesting lines
+    out = (result.stdout or "").strip()
+    err = (result.stderr or "").strip()
+    if out:
+        # Keep last ~80 lines so error context shows even on large logs
+        lines = out.splitlines()
+        if len(lines) > 80:
+            lines = ["... (truncated, showing last 80 lines) ..."] + lines[-80:]
+        parts.append("\n--- MSBuild Output ---\n" + "\n".join(lines))
+    if err:
+        parts.append("\n--- MSBuild Stderr ---\n" + err)
 
     return "\n".join(parts)
 

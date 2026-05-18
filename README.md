@@ -175,10 +175,25 @@ This generates:
 - [uv](https://docs.astral.sh/uv/) package manager
 - A Pascal compiler (Free Pascal, Delphi, or RAD Studio)
 
-### Quick Start
+### Option 1 — Run from PyPI (recommended)
+
+Once a release is published to PyPI, no clone is needed:
 
 ```bash
-# Clone the repository
+uvx --from claude-pascal-mcp pascal-mcp
+```
+
+### Option 2 — Run straight from GitHub (no PyPI required)
+
+```bash
+uvx --from git+https://github.com/tina4stack/claude-pascal-mcp pascal-mcp
+```
+
+Pin to a tag for reproducibility: `git+https://github.com/tina4stack/claude-pascal-mcp@v0.1.0`.
+
+### Option 3 — Local development clone
+
+```bash
 git clone https://github.com/tina4stack/claude-pascal-mcp.git
 cd claude-pascal-mcp
 
@@ -194,11 +209,47 @@ uv run pascal-preview
 
 ### Register with Claude Code
 
+PyPI install:
+
+```bash
+claude mcp add --transport stdio pascal-dev -- uvx --from claude-pascal-mcp pascal-mcp
+```
+
+Git install:
+
+```bash
+claude mcp add --transport stdio pascal-dev -- uvx --from git+https://github.com/tina4stack/claude-pascal-mcp pascal-mcp
+```
+
+Local clone:
+
 ```bash
 claude mcp add --transport stdio pascal-dev -- uv run --directory /path/to/claude-pascal-mcp pascal-mcp
 ```
 
-Or add to your project's `.mcp.json`:
+Or add to your project's `.mcp.json` — pick the form that matches how you installed:
+
+```json
+{
+  "mcpServers": {
+    "pascal-dev": {
+      "command": "uvx",
+      "args": ["--from", "claude-pascal-mcp", "pascal-mcp"]
+    }
+  }
+}
+```
+
+```json
+{
+  "mcpServers": {
+    "pascal-dev": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/tina4stack/claude-pascal-mcp", "pascal-mcp"]
+    }
+  }
+}
+```
 
 ```json
 {
@@ -213,7 +264,18 @@ Or add to your project's `.mcp.json`:
 
 ### Register with Claude Desktop
 
-Add to your `claude_desktop_config.json`:
+Add to your `claude_desktop_config.json` (pick the form matching your install):
+
+```json
+{
+  "mcpServers": {
+    "pascal-dev": {
+      "command": "uvx",
+      "args": ["--from", "claude-pascal-mcp", "pascal-mcp"]
+    }
+  }
+}
+```
 
 ```json
 {
@@ -225,6 +287,26 @@ Add to your `claude_desktop_config.json`:
   }
 }
 ```
+
+## Releasing
+
+Maintainer notes — cutting a new release publishes to PyPI automatically.
+
+1. Bump `version` in `pyproject.toml`.
+2. Commit and tag: `git tag v0.1.0 && git push origin v0.1.0`.
+3. GitHub Actions (`.github/workflows/publish.yml`) builds the sdist + wheel, publishes to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/), and attaches the artifacts to a GitHub Release.
+
+**One-time PyPI Trusted Publisher setup** (required before the first release):
+
+- Create the project on [pypi.org](https://pypi.org) (or reserve it via a first manual `uv publish`).
+- Under *Project → Publishing → Add a new publisher*, configure GitHub Actions:
+  - Owner: `tina4stack`
+  - Repository: `claude-pascal-mcp`
+  - Workflow: `publish.yml`
+  - Environment: `pypi`
+- In the GitHub repo, create an environment named `pypi` (Settings → Environments).
+
+No API tokens needed — OIDC handles auth.
 
 ### Preview Bridge Setup
 

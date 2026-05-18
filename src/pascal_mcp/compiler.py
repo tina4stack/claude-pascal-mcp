@@ -680,3 +680,126 @@ def cleanup_compile_result(result: CompileResult) -> None:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def _find_rsvars(studio_root: str) -> str | None:
+    """Locate rsvars.bat for a given Studio install (e.g. .../Studio/37.0)."""
+    candidate = os.path.join(studio_root, "bin", "rsvars.bat")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _discover_studio_roots() -> list[str]:
+    """Find all installed RAD Studio versions."""
+    roots = glob.glob(r"C:\Program Files (x86)\Embarcadero\Studio\*")
+    return sorted([r for r in roots if os.path.isdir(r)], reverse=True)
+
+
+def build_existing_dproj(
+    dproj_path: str,
+    config: str = "Debug",
+    platform: str = "Win32",
+    target: str = "Build",
+    studio_root: str | None = None,
+    timeout: int = 600,
+) -> CompileResult:
+    """Build an existing Delphi .dproj using MSBuild + rsvars.bat.
+
+    Unlike compile_project (which generates a project from a template),
+    this builds a real, multi-file .dproj exactly as RAD Studio would —
+    honouring the project's own unit search paths, conditional defines,
+    namespace settings, and resource compilation.
+
+    Args:
+        dproj_path: Absolute path to the .dproj file.
+        config: Build configuration (Debug, Release, etc.).
+        platform: Target platform (Win32, Win64, Android64, iOSDevice64, OSX64).
+        target: MSBuild target (Build, Rebuild, Clean).
+        studio_root: Optional Studio install root (e.g. r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0").
+            If omitted, picks the highest-version install detected.
+        timeout: Seconds before the build is killed.
+
+    Returns:
+        CompileResult with success flag, exit code, and combined output.
+        exe_path is set to the conventional output path under the project's
+        bin\\<Platform>\\<Config> if the build succeeded.
+    """
+    if not os.path.isfile(dproj_path):
+        return CompileResult(
+            success=False, exit_code=-1,
+            stdout="", stderr=f"dproj not found: {dproj_path}",
+            compiler_used="msbuild",
+        )
+
+    # Pick Studio install
+    if studio_root is None:
+        roots = _discover_studio_roots()
+        if not roots:
+            return CompileResult(
+                success=False, exit_code=-1,
+                stdout="", stderr="No RAD Studio installation found under C:\\Program Files (x86)\\Embarcadero\\Studio",
+                compiler_used="msbuild",
+            )
+        studio_root = roots[0]
+
+    rsvars = _find_rsvars(studio_root)
+    if rsvars is None:
+        return CompileResult(
+            success=False, exit_code=-1,
+            stdout="", stderr=f"rsvars.bat not found under {studio_root}\\bin",
+            compiler_used="msbuild",
+        )
+
+    project_dir = os.path.dirname(dproj_path)
+    project_file = os.path.basename(dproj_path)
+
+    # Write a temp .bat that calls rsvars and then MSBuild. Avoids the
+    # quoting nightmare of passing a compound `"x" && y` line through
+    # subprocess+CreateProcess+cmd.exe on Windows (each layer mangles
+    # the inner quotes differently).
+    bat_fd, bat_path = tempfile.mkstemp(suffix=".bat", text=True)
+    try:
+        with os.fdopen(bat_fd, "w") as f:
+            f.write("@echo off\r\n")
+            f.write(f'call "{rsvars}"\r\n')
+            f.write(f'cd /d "{project_dir}"\r\n')
+            f.write(
+                f'MSBuild "{project_file}" /t:{target} '
+                f'/p:Config={config} /p:Platform={platform} '
+                f'/nologo /verbosity:minimal\r\n'
+            )
+
+        try:
+            proc = subprocess.run(
+                ["cmd.exe", "/c", bat_path],
+                capture_output=True, text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return CompileResult(
+                success=False, exit_code=-1,
+                stdout="", stderr=f"Build timed out after {timeout}s",
+                compiler_used="msbuild",
+            )
+    finally:
+        try:
+            os.unlink(bat_path)
+        except OSError:
+            pass
+
+    success = proc.returncode == 0
+    exe_path: str | None = None
+    if success:
+        # Convention: <project_dir>\bin\<Platform>\<Config>\<ProjectName>.exe
+        project_name = os.path.splitext(project_file)[0]
+        candidate = os.path.join(project_dir, "bin", platform, config, project_name + ".exe")
+        if os.path.isfile(candidate):
+            exe_path = candidate
+
+    return CompileResult(
+        success=success,
+        exit_code=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        compiler_used=f"MSBuild ({platform} {config}) via {os.path.basename(studio_root)}",
+        exe_path=exe_path,
+    )
