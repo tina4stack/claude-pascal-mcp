@@ -694,6 +694,79 @@ def _discover_studio_roots() -> list[str]:
     return sorted([r for r in roots if os.path.isdir(r)], reverse=True)
 
 
+def _artifact_extension(platform: str) -> str:
+    """Return the conventional artifact extension for a Delphi target platform."""
+    p = platform.lower()
+    if p.startswith("android"):
+        return ".apk"
+    if p.startswith("ios"):
+        return ".app"
+    if p.startswith("osx"):
+        return ".app"
+    if p.startswith("linux"):
+        return ""
+    return ".exe"
+
+
+def _resolve_artifact_path(
+    project_dir: str, project_name: str, platform: str, config: str
+) -> str | None:
+    """Look in the conventional locations where Delphi drops the output artifact.
+
+    Different Delphi versions and project configurations use different output
+    layouts. We probe the common candidates and return the first one that exists.
+    """
+    ext = _artifact_extension(platform)
+    name = project_name + ext
+
+    candidates = [
+        # Newer common convention with explicit bin\ prefix
+        os.path.join(project_dir, "bin", platform, config, name),
+        # Default Delphi output layout
+        os.path.join(project_dir, platform, config, name),
+        # Android: Delphi nests through a staging subdir before APK packaging
+        os.path.join(project_dir, platform, config, project_name, "bin", name),
+        os.path.join(project_dir, "bin", platform, config, project_name, "bin", name),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _deep_clean_platform_dirs(
+    project_dir: str, platform: str, config: str
+) -> list[str]:
+    """Nuke the intermediate + final output dirs for a given platform/config.
+
+    Delphi's own MSBuild Clean / Rebuild targets do NOT fully clean the Android
+    pipeline. They wipe DCU and .o files but leave behind:
+
+      - The PAClient staging directory under <Platform>\\<Config>\\<ProjectName>\\
+        (stale assets, libs, classes, AndroidManifest.xml). These are repackaged
+        into the next APK, which is why "I changed the code but the APK didn't
+        update" complaints happen.
+      - The previous APK at bin\\<Platform>\\<Config>\\<ProjectName>.apk.
+      - The classes.dex / R.java / aapt caches.
+
+    This helper removes the per-config subdirectories so the next build starts
+    from a clean slate. It does NOT touch source files, the .dproj, or sibling
+    config directories (e.g. running Debug clean leaves Release alone).
+
+    Returns the list of directories that were removed (or attempted).
+    """
+    targets = [
+        os.path.join(project_dir, platform, config),
+        os.path.join(project_dir, "bin", platform, config),
+    ]
+    removed: list[str] = []
+    for t in targets:
+        if os.path.isdir(t):
+            shutil.rmtree(t, ignore_errors=True)
+            removed.append(t)
+    return removed
+
+
 def build_existing_dproj(
     dproj_path: str,
     config: str = "Debug",
@@ -701,6 +774,7 @@ def build_existing_dproj(
     target: str = "Build",
     studio_root: str | None = None,
     timeout: int = 600,
+    deep_clean: bool | None = None,
 ) -> CompileResult:
     """Build an existing Delphi .dproj using MSBuild + rsvars.bat.
 
@@ -717,11 +791,18 @@ def build_existing_dproj(
         studio_root: Optional Studio install root (e.g. r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0").
             If omitted, picks the highest-version install detected.
         timeout: Seconds before the build is killed.
+        deep_clean: If True, nuke the platform's intermediate + bin output
+            directories before invoking MSBuild. If False, never deep-clean.
+            If None (default), auto-enables for Android targets when target is
+            "Rebuild" or "Clean" — Delphi's own Clean target leaves PAClient
+            staging and the previous APK in place, which causes stale-asset
+            and stale-code bugs.
 
     Returns:
         CompileResult with success flag, exit code, and combined output.
-        exe_path is set to the conventional output path under the project's
-        bin\\<Platform>\\<Config> if the build succeeded.
+        exe_path is set to the resolved output artifact path (.exe / .apk /
+        .app depending on platform) if the build succeeded and a known
+        artifact location exists.
     """
     if not os.path.isfile(dproj_path):
         return CompileResult(
@@ -751,6 +832,23 @@ def build_existing_dproj(
 
     project_dir = os.path.dirname(dproj_path)
     project_file = os.path.basename(dproj_path)
+    project_name = os.path.splitext(project_file)[0]
+
+    # Auto-enable deep clean for Android Rebuild/Clean — Delphi's own clean
+    # is incomplete for the Android pipeline (see _deep_clean_platform_dirs).
+    if deep_clean is None:
+        deep_clean = (
+            platform.lower().startswith("android")
+            and target.lower() in ("rebuild", "clean")
+        )
+
+    cleaned_dirs: list[str] = []
+    if deep_clean:
+        cleaned_dirs = _deep_clean_platform_dirs(project_dir, platform, config)
+
+    # If the requested target was "Clean", we've already done the meaningful
+    # work via deep_clean; still invoke MSBuild Clean for symmetry so the
+    # in-tree DCU/.o files Delphi tracks get removed too.
 
     # Write a temp .bat that calls rsvars and then MSBuild. Avoids the
     # quoting nightmare of passing a compound `"x" && y` line through
@@ -789,16 +887,24 @@ def build_existing_dproj(
     success = proc.returncode == 0
     exe_path: str | None = None
     if success:
-        # Convention: <project_dir>\bin\<Platform>\<Config>\<ProjectName>.exe
-        project_name = os.path.splitext(project_file)[0]
-        candidate = os.path.join(project_dir, "bin", platform, config, project_name + ".exe")
-        if os.path.isfile(candidate):
-            exe_path = candidate
+        exe_path = _resolve_artifact_path(project_dir, project_name, platform, config)
+
+    # Stitch any deep-clean record onto the front of stdout so the caller can
+    # see what was wiped. Keeps a single channel for the human-readable trace.
+    clean_log = ""
+    if cleaned_dirs:
+        clean_log = (
+            "Deep-cleaned (Delphi's own Clean misses these for Android):\n"
+            + "\n".join(f"  - {d}" for d in cleaned_dirs)
+            + "\n\n"
+        )
+    elif deep_clean:
+        clean_log = "Deep clean requested; no stale platform dirs found.\n\n"
 
     return CompileResult(
         success=success,
         exit_code=proc.returncode,
-        stdout=proc.stdout,
+        stdout=clean_log + (proc.stdout or ""),
         stderr=proc.stderr,
         compiler_used=f"MSBuild ({platform} {config}) via {os.path.basename(studio_root)}",
         exe_path=exe_path,

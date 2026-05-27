@@ -466,6 +466,7 @@ async def build_dproj(
     target: str = "Build",
     studio_root: str | None = None,
     timeout: int = 600,
+    deep_clean: bool | None = None,
 ) -> str:
     """Build an existing Delphi .dproj project file using MSBuild + rsvars.bat.
 
@@ -479,6 +480,15 @@ async def build_dproj(
     from a TButton/TEdit/TLabel/TMemo template. build_dproj is for building
     an existing real project. Use the right one.
 
+    ANDROID CLEANING: Delphi's own MSBuild Clean/Rebuild targets do NOT fully
+    clean the Android build pipeline — they wipe DCU/.o files but leave the
+    PAClient staging directory and the previous APK in place. That causes the
+    classic "I changed code/assets but the new APK didn't update" symptom.
+    When platform starts with "Android" and target is Rebuild or Clean, this
+    tool automatically deep-cleans the platform's intermediate and bin
+    directories before invoking MSBuild. Pass deep_clean=False to disable,
+    or deep_clean=True to force it on for other platforms.
+
     Args:
         dproj_path: Absolute path to the .dproj file
             (e.g. r"D:\\projects\\cuttlefishmobile\\src\\CuttlefishV2.dproj").
@@ -490,6 +500,9 @@ async def build_dproj(
         studio_root: Optional Studio install (e.g. r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0").
             Defaults to the highest-version install detected.
         timeout: Seconds before the build is killed (default 600).
+        deep_clean: Nuke the platform's intermediate + bin dirs before building.
+            None (default) auto-enables for Android Rebuild/Clean. True forces
+            it on for any platform. False disables it entirely.
     """
     result = build_existing_dproj(
         dproj_path=dproj_path,
@@ -498,6 +511,7 @@ async def build_dproj(
         target=target,
         studio_root=studio_root,
         timeout=timeout,
+        deep_clean=deep_clean,
     )
 
     parts = [
@@ -508,7 +522,7 @@ async def build_dproj(
         f"Success: {result.success}",
     ]
     if result.exe_path:
-        parts.append(f"Executable: {result.exe_path}")
+        parts.append(f"Artifact: {result.exe_path}")
 
     # Trim noisy MSBuild output to the interesting lines
     out = (result.stdout or "").strip()
