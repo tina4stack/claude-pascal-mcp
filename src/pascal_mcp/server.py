@@ -676,6 +676,229 @@ async def check_ios_deploy(
 
 
 @mcp.tool()
+async def paserver_info(profile: str, studio_root: str | None = None) -> str:
+    """Read local info about a PAServer Connection Profile (paclient -l).
+
+    Pure local read — does NOT touch the network. Returns the host, port,
+    platform tag, and sysroot path the IDE has stored for this profile.
+    The profile name must already exist in HKCU registry (use
+    list_remote_profiles to enumerate). paclient itself doesn't error on
+    unknown names — it returns synthesised defaults — so we validate
+    against the registry first to catch typos with a clear error.
+
+    Args:
+        profile: Connection Profile name (e.g. "MACBOOK"). Case-sensitive.
+        studio_root: Optional Studio install root. Defaults to the
+            highest-version detected.
+    """
+    from pascal_mcp.paclient import find_paclient, get_paserver_info
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return (
+            "paclient.exe not found. Expected at "
+            "<studio_root>\\bin\\paclient.exe. Is RAD Studio installed?"
+        )
+    version = None
+    if studio_root:
+        version = _studio_version_from_root(studio_root)
+    info = get_paserver_info(pc, profile, studio_version=version)
+    if info is None:
+        return (
+            f"Profile '{profile}' is not registered in HKCU\\Software\\Embarcadero"
+            f"\\BDS\\<ver>\\RemoteProfiles. Use list_remote_profiles to see what "
+            "is available, or create one in Connection Profile Manager."
+        )
+    return (
+        f"Profile:   {info.profile}\n"
+        f"Location:  {info.location}\n"
+        f"Platform:  {info.platform}\n"
+        f"Host:      {info.host}:{info.port}\n"
+        f"Sysroot:   {info.sysroot}\n"
+        "(Password is the registry-encrypted form; not echoed.)"
+    )
+
+
+@mcp.tool()
+async def paserver_check_connection(
+    profile: str,
+    timeout: float = 3.0,
+    studio_root: str | None = None,
+) -> str:
+    """Two-stage reachability check for a PAServer Connection Profile.
+
+    Runs:
+      1. Registry/paclient lookup to confirm the profile exists locally
+         and resolve its host:port.
+      2. A plain TCP connect to that host:port to confirm PAServer is
+         listening.
+
+    Doesn't perform a full PAServer protocol handshake (that requires the
+    paclient password and isn't necessary to answer "is the host even
+    reachable"). For full validation, run any file-transfer tool against
+    the profile — paclient will surface protocol-level errors.
+
+    Use this as the first pre-flight step before iOS/macOS/Linux builds
+    or before paserver_get/paserver_put. Answers ~90% of "why is my
+    PAServer build failing" questions immediately.
+
+    Args:
+        profile: Connection Profile name (e.g. "MACBOOK").
+        timeout: TCP connect timeout in seconds. Default 3.
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, check_paserver_connection
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found under any RAD Studio install."
+    result = check_paserver_connection(pc, profile, timeout=timeout)
+    lines = [
+        f"Profile: {result.profile}",
+        f"Host:    {result.host}:{result.port}",
+        f"profile_ok: {result.profile_ok}",
+        f"tcp_ok:     {result.tcp_ok}",
+        "",
+    ]
+    lines.extend(f"  - {n}" for n in result.notes)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def paserver_scratch_dir(profile: str, remote_user: str) -> str:
+    """Return PAServer's per-profile scratch directory path on the remote host.
+
+    PAServer in restricted mode (the default) only allows file ops inside
+    /Users/<remote_user>/PAServer/scratch-dir/<windows_user>-<PROFILE>/.
+    Use this helper to get the right path before calling paserver_put /
+    paserver_get, or to clean up after a build.
+
+    Args:
+        profile: Connection Profile name (e.g. "MACBOOK").
+        remote_user: Unix username running paserver on the Mac/Linux host.
+            You can find this by SSHing to the host once, or check the
+            PAServer terminal output for the home dir.
+    """
+    from pascal_mcp.paclient import paserver_scratch_dir as compose
+    return compose(profile, remote_user)
+
+
+@mcp.tool()
+async def paserver_get(
+    profile: str,
+    remote_path: str,
+    local_dir: str,
+    timeout: int = 300,
+    studio_root: str | None = None,
+) -> str:
+    """Pull a file or directory from the PAServer remote host to this box.
+
+    Wraps `paclient -g <remote>,<local_dir>`. The remote_path can use
+    PAClient's wildcard syntax (e.g. ``Documents/logs/*.txt``). Useful for
+    pulling crash logs, build artifacts the IDE assembled on the remote
+    (codesigned .app bundles, .ipa files), or any other file you need
+    without setting up a separate SSH layer.
+
+    Args:
+        profile: Connection Profile name.
+        remote_path: Path on the PAServer host. May contain wildcards.
+        local_dir: Local directory to drop the files into. Created if
+            missing.
+        timeout: Seconds before the transfer is killed (default 300).
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, paserver_get as do_get
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_get(pc, profile, remote_path, local_dir, timeout=timeout)
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n\n"
+    )
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
+async def paserver_put(
+    profile: str,
+    local_path: str,
+    remote_dir: str,
+    timeout: int = 300,
+    studio_root: str | None = None,
+) -> str:
+    """Push a file or directory from this box to the PAServer remote host.
+
+    Wraps `paclient -u <local>,<remote_dir>`. The local_path can use
+    wildcard syntax (e.g. ``build\\\\*.so``). Useful for staging files for
+    a manual remote build, replacing assets the IDE didn't deploy, or
+    seeding the PAServer scratch directory.
+
+    Args:
+        profile: Connection Profile name.
+        local_path: File or directory on this Windows box. May contain
+            wildcards.
+        remote_dir: Destination directory on the PAServer host.
+        timeout: Seconds before the transfer is killed (default 300).
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, paserver_put as do_put
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_put(pc, profile, local_path, remote_dir, timeout=timeout)
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n\n"
+    )
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
+async def paserver_remove(
+    profile: str,
+    remote_path: str,
+    timeout: int = 60,
+    studio_root: str | None = None,
+) -> str:
+    """Delete a file or directory on the PAServer remote host.
+
+    Wraps `paclient -R <remote_path>` (capital-R: removes from the *remote*
+    host, not the local cache). Use to clean up scratch dirs or old
+    deployments. Be careful with wildcards.
+
+    Args:
+        profile: Connection Profile name.
+        remote_path: Path on the PAServer host. Wildcards allowed.
+        timeout: Seconds before the operation is killed (default 60).
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, paserver_remove as do_remove
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_remove(pc, profile, remote_path, timeout=timeout)
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n\n"
+    )
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
 async def list_remote_profiles(studio_root: str | None = None) -> str:
     """List PAServer Connection Profiles registered in this RAD Studio install.
 
