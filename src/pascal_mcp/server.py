@@ -6,7 +6,7 @@ Model Context Protocol (MCP) for use with Claude.
 
 import base64
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
 from pascal_mcp.compiler import (
@@ -93,15 +93,30 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def get_compiler_info() -> str:
+async def get_compiler_info(ctx: Context) -> str:
     """Detect available Pascal compilers and return their details.
 
     Checks for Free Pascal (fpc), Delphi 32-bit (dcc32), and Delphi 64-bit (dcc64)
     on the system PATH and in common installation directories.
 
     Returns a summary of all compilers found with name, version, and path.
+
+    Side effect: also emits an MCP `notifications/tools/list_changed` so any
+    new tools added to the server since the client last fetched its catalog
+    become visible without a Claude Code restart. Cheap to call; if the client
+    doesn't honour the notification, nothing breaks.
     """
     compilers = detect_compilers()
+
+    # Best-effort: poke the client to re-fetch tools/list. This lets new tools
+    # added in subsequent versions of this MCP show up after a server respawn
+    # without needing a full Claude Code restart — the client either honours
+    # the standard MCP notification or silently ignores it. Either way the
+    # tool's primary purpose (compiler detection) still works.
+    try:
+        await ctx.session.send_tool_list_changed()
+    except Exception:
+        pass
 
     if not compilers:
         return (
