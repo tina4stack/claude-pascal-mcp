@@ -467,6 +467,7 @@ async def build_dproj(
     studio_root: str | None = None,
     timeout: int = 600,
     deep_clean: bool | None = None,
+    remote_profile: str | None = None,
 ) -> str:
     """Build an existing Delphi .dproj project file using MSBuild + rsvars.bat.
 
@@ -480,29 +481,44 @@ async def build_dproj(
     from a TButton/TEdit/TLabel/TMemo template. build_dproj is for building
     an existing real project. Use the right one.
 
-    ANDROID CLEANING: Delphi's own MSBuild Clean/Rebuild targets do NOT fully
-    clean the Android build pipeline — they wipe DCU/.o files but leave the
-    PAClient staging directory and the previous APK in place. That causes the
-    classic "I changed code/assets but the new APK didn't update" symptom.
-    When platform starts with "Android" and target is Rebuild or Clean, this
-    tool automatically deep-cleans the platform's intermediate and bin
-    directories before invoking MSBuild. Pass deep_clean=False to disable,
-    or deep_clean=True to force it on for other platforms.
+    STAGING CLEAN (Android / iOS / macOS / Linux): Delphi's own MSBuild
+    Clean/Rebuild targets do NOT fully clean staging-based build pipelines.
+    They wipe DCU/.o files but leave the PAClient (Android) or PAServer
+    (iOS/macOS/Linux) staging directory and the previous artifact in place.
+    That causes the classic "I changed code/assets but the new APK/app
+    didn't update" symptom. When platform is Android/iOS/macOS/Linux and
+    target is Rebuild or Clean, this tool automatically deep-cleans the
+    platform's intermediate and bin directories before invoking MSBuild.
+    Pass deep_clean=False to disable, or deep_clean=True to force it.
+
+    PASERVER (iOS / macOS / Linux): cross-builds for these platforms run
+    through PAServer on a remote Mac or Linux host. Pass remote_profile
+    with the name of a Connection Profile already configured in RAD Studio
+    (Tools → Options → Environment Options → Connection Profile Manager).
+    PAServer must be running on the target host. If the .dproj already
+    pins a default profile you can omit remote_profile, but explicit is
+    safer. This tool does not create profiles or store credentials —
+    the profile must already exist locally on the dev machine.
 
     Args:
         dproj_path: Absolute path to the .dproj file
             (e.g. r"D:\\projects\\cuttlefishmobile\\src\\CuttlefishV2.dproj").
         config: Build config — Debug, Release, etc. (default Debug).
-        platform: Target platform — Win32, Win64, Android64, iOSDevice64, OSX64
-            (default Win32). For Cuttlefish always use Win32 unless explicitly
-            building the Android APK.
+        platform: Target platform — Win32, Win64, Android64, iOSDevice64,
+            iOSSimARM64, OSX64, OSXARM64, Linux64 (default Win32). For
+            Cuttlefish always use Win32 unless explicitly building for mobile.
         target: MSBuild target — Build (default), Rebuild (clean+build), or Clean.
         studio_root: Optional Studio install (e.g. r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0").
             Defaults to the highest-version install detected.
-        timeout: Seconds before the build is killed (default 600).
+        timeout: Seconds before the build is killed (default 600). Remote
+            iOS/macOS/Linux builds can be slow on first run — bump to 1800+
+            if PAServer needs to re-deploy a large bundle.
         deep_clean: Nuke the platform's intermediate + bin dirs before building.
-            None (default) auto-enables for Android Rebuild/Clean. True forces
-            it on for any platform. False disables it entirely.
+            None (default) auto-enables for Android/iOS/macOS/Linux Rebuild
+            or Clean. True forces it on for any platform. False disables it.
+        remote_profile: Name of the RAD Studio Connection Profile for PAServer.
+            Required for iOS/macOS/Linux unless the .dproj pins a default.
+            Ignored for Win32/Win64/Android. Example: "MyMacMini".
     """
     result = build_existing_dproj(
         dproj_path=dproj_path,
@@ -512,6 +528,7 @@ async def build_dproj(
         studio_root=studio_root,
         timeout=timeout,
         deep_clean=deep_clean,
+        remote_profile=remote_profile,
     )
 
     parts = [
