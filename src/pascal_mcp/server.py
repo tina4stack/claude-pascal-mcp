@@ -472,6 +472,7 @@ async def build_dproj(
     deep_clean: bool | None = None,
     remote_profile: str | None = None,
     deploy: bool | None = None,
+    synthesize_ios_manifest: bool = False,
 ) -> str:
     """Build an existing Delphi .dproj project file using MSBuild + rsvars.bat.
 
@@ -542,6 +543,16 @@ async def build_dproj(
             staged on remote). None (default) auto-enables for those
             platforms whenever target isn't Clean. False keeps the legacy
             "compile and link only" behaviour. Ignored for Win32/Win64.
+        synthesize_ios_manifest: For iOS targets only. The IDE writes 4
+            DeployFile entries per Config × Platform on first deploy
+            (Entitlements, InfoPList, LaunchScreen, ProjectOutput). Command-
+            line Deploy can't synthesize them, so projects never IDE-deployed
+            to iOS fail with cryptic "codesign … No such file" errors.
+            Setting this True auto-adds the missing entries to the .dproj
+            before Deploy runs, after writing a timestamped .bak backup.
+            Default False — the build trace will report what's missing
+            without mutating anything. Use check_ios_deploy to inspect
+            without building.
     """
     result = build_existing_dproj(
         dproj_path=dproj_path,
@@ -553,6 +564,7 @@ async def build_dproj(
         deep_clean=deep_clean,
         remote_profile=remote_profile,
         deploy=deploy,
+        synthesize_ios_manifest=synthesize_ios_manifest,
     )
 
     parts = [
@@ -578,6 +590,49 @@ async def build_dproj(
         parts.append("\n--- MSBuild Stderr ---\n" + err)
 
     return "\n".join(parts)
+
+
+@mcp.tool()
+async def check_ios_deploy(
+    dproj_path: str,
+    config: str = "Debug",
+    platform: str = "iOSDevice64",
+) -> str:
+    """Check whether a .dproj has the iOS DeployFile entries required for Deploy.
+
+    PAServer's iOS Deploy target reads the dproj's <Deployment> section to
+    decide what to ship to the Mac for codesign + .app assembly. The IDE
+    writes 4 entries per Config × Platform on first deploy:
+    ProjectiOSEntitlements, ProjectiOSInfoPList, ProjectiOSLaunchScreen,
+    ProjectOutput. If they're missing — common when a project was renamed
+    or never IDE-deployed to a given target — Deploy ships nothing and
+    codesign fails with "<Proj>.app: No such file or directory".
+
+    This tool only INSPECTS; it never mutates. Use synthesize_ios_manifest=True
+    on build_dproj to add missing entries (with .bak backup).
+
+    Args:
+        dproj_path: Absolute path to the .dproj.
+        config: Build configuration to check (Debug, Release, etc.).
+        platform: iOS platform: iOSDevice64 or iOSSimARM64.
+    """
+    import os as _os
+    from pascal_mcp.iosdeploy import detect_ios_deploy_entries
+    if not _os.path.isfile(dproj_path):
+        return f"dproj not found: {dproj_path}"
+    project_name = _os.path.splitext(_os.path.basename(dproj_path))[0]
+    status = detect_ios_deploy_entries(dproj_path, config, platform, project_name)
+    lines = [
+        f"Project:  {project_name}",
+        f"Config:   {config}",
+        f"Platform: {platform}",
+        f"Ready:    {status.ready_to_deploy}",
+        f"Present:  {', '.join(status.present_classes) or '(none)'}",
+        f"Missing:  {', '.join(status.missing_classes) or '(none)'}",
+        "",
+        status.summary(),
+    ]
+    return "\n".join(lines)
 
 
 @mcp.tool()

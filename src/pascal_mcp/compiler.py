@@ -11,6 +11,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from pascal_mcp.iosdeploy import (
+    detect_ios_deploy_entries,
+    synthesize_ios_deploy_entries,
+)
+
 # Registry access — Windows-only stdlib module. The build_dproj/PAServer code
 # paths only run on Windows anyway (rsvars.bat is Windows), but guard the
 # import so the module can still be loaded on Linux/macOS for the FPC path.
@@ -1206,6 +1211,7 @@ def build_existing_dproj(
     deep_clean: bool | None = None,
     remote_profile: str | None = None,
     deploy: bool | None = None,
+    synthesize_ios_manifest: bool = False,
 ) -> CompileResult:
     """Build an existing Delphi .dproj using MSBuild + rsvars.bat.
 
@@ -1249,6 +1255,17 @@ def build_existing_dproj(
             iOS/macOS (.app bundle) and Linux. None (default) auto-enables
             for any staging platform (Android/iOS/macOS/Linux) unless the
             target is Clean. False keeps the old "compile only" behaviour.
+        synthesize_ios_manifest: For iOS targets only — if the dproj's
+            <Deployment> section is missing any of the 4 per-config
+            DeployFile entries the IDE writes on first deploy
+            (ProjectiOSEntitlements, ProjectiOSInfoPList,
+            ProjectiOSLaunchScreen, ProjectOutput), synthesize them from
+            the build output layout before running Deploy. A timestamped
+            .bak backup of the dproj is written first. Default False —
+            the tool reports what's missing in the trace but won't mutate
+            the dproj unless you opt in. Without these entries Deploy
+            ships nothing and codesign fails with "<Proj>.app: No such
+            file or directory".
 
     Returns:
         CompileResult with success flag, exit code, and combined output.
@@ -1352,6 +1369,52 @@ def build_existing_dproj(
             _needs_staging_clean(platform)
             and target.lower() not in ("clean",)
         )
+
+    # iOS deploy manifest check. For projects never IDE-deployed to a given
+    # iOS Config × Platform, the dproj's <Deployment> section lacks the 4
+    # DeployFile entries (Entitlements, InfoPList, LaunchScreen, ProjectOutput)
+    # that PAServer Deploy needs to assemble the .app bundle. Without them
+    # codesign fails with "<Proj>.app: No such file or directory".
+    ios_manifest_log = ""
+    if platform.lower().startswith("ios") and deploy and target.lower() != "clean":
+        status = detect_ios_deploy_entries(
+            dproj_path, config=config, platform=platform, project_name=project_name,
+        )
+        if not status.ready_to_deploy:
+            # Compute the LocalName prefix from the resolved DCC_ExeOutput so
+            # synthesized entries match the dproj's actual output layout
+            # (typically ..\\bin\\<Platform>\\<Config> on real projects).
+            exe_out = dproj_paths.get("DCC_ExeOutput", "")
+            if exe_out:
+                rel_dir = os.path.relpath(exe_out, project_dir).replace("/", "\\")
+            else:
+                rel_dir = os.path.join("..", "bin", platform, config)
+
+            if synthesize_ios_manifest:
+                ok, msg, bak = synthesize_ios_deploy_entries(
+                    dproj_path,
+                    config=config,
+                    platform=platform,
+                    project_name=project_name,
+                    exe_output_dir_relative=rel_dir,
+                    missing_classes=status.missing_classes,
+                )
+                if ok:
+                    ios_manifest_log = (
+                        f"iOS deploy manifest: synthesized {len(status.missing_classes)} "
+                        f"missing entries. {msg}"
+                    )
+                    if bak:
+                        ios_manifest_log += f"\n  Backup: {bak}"
+                    ios_manifest_log += "\n\n"
+                else:
+                    ios_manifest_log = (
+                        f"iOS deploy manifest: synthesis FAILED. {msg}\n\n"
+                    )
+            else:
+                ios_manifest_log = status.summary() + "\n\n"
+        else:
+            ios_manifest_log = status.summary() + "\n\n"
 
     # Build the MSBuild target list. Chained with ';' so it runs in a single
     # MSBuild invocation — one rsvars setup, one project load, one PAServer
@@ -1465,7 +1528,10 @@ def build_existing_dproj(
     return CompileResult(
         success=success,
         exit_code=proc.returncode,
-        stdout=target_log + paserver_log + dproj_log + clean_log + (proc.stdout or ""),
+        stdout=(
+            target_log + paserver_log + ios_manifest_log
+            + dproj_log + clean_log + (proc.stdout or "")
+        ),
         stderr=proc.stderr,
         compiler_used=f"MSBuild ({platform} {config}) via {os.path.basename(studio_root)}",
         exe_path=exe_path,
