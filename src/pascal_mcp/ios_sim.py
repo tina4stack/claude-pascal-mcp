@@ -109,12 +109,19 @@ def sim_screenshot_b64(
 ) -> SSHResult:
     """Capture a simulator screenshot and return it as base64 PNG over stdout.
 
-    The simctl screenshot tool needs a destination path. We write to a temp
-    file on the Mac, pipe through base64, and clean up. Caller decodes.
+    The simctl screenshot tool needs a destination path. We write to a unique
+    /tmp file on the Mac, base64 it onto stdout, and clean up. The redirect
+    order silences simctl's own diagnostic chatter ("Note: No display
+    specified...") so stdout is pure base64 and the caller can decode it
+    cleanly.
+
+    macOS mktemp doesn't substitute X's the way GNU mktemp does, so we use
+    $$.$RANDOM for uniqueness instead — that's portable across all Mac /
+    Linux shells without -- needing an external uuidgen.
     """
     cmd = (
-        "tmp=$(mktemp -t simshot.XXXXXX.png); "
-        f"xcrun simctl io {shell_quote(udid)} screenshot \"$tmp\" 2>&1 >/dev/null && "
-        "base64 -i \"$tmp\" && rm -f \"$tmp\""
+        'tmp="/tmp/simshot.$$.$RANDOM.png"; '
+        f"xcrun simctl io {shell_quote(udid)} screenshot \"$tmp\" >/dev/null 2>&1 && "
+        'base64 -i "$tmp" 2>/dev/null && rm -f "$tmp"'
     )
     return ssh_run(host, user, cmd, key_path=key_path, timeout=timeout)
