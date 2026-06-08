@@ -743,6 +743,38 @@ async def setup_fpc(
 
 
 @mcp.tool()
+async def focus_ide() -> str:
+    """Restore the Delphi/Lazarus IDE window and bring it to the foreground.
+
+    Finds a running RAD Studio / Delphi / Lazarus IDE and:
+      1. If minimized, calls ShowWindow(SW_RESTORE) to un-minimize it.
+      2. Calls SetForegroundWindow to make it the active window.
+
+    This is the precondition for many IDE-driven workflows: observe_ide's
+    screenshot is more reliable on a foreground window (the Windows
+    Graphics Capture path can't reach GPU-composited Skia panels behind
+    other windows), and any UI automation needs the window visible. Call
+    this first whenever you're about to interact with the IDE.
+
+    Returns a one-line confirmation with the window title, or a clear
+    error if no IDE is running.
+    """
+    from pascal_mcp.screenshot import _bring_window_to_front
+    ide = find_ide_window()
+    if ide is None:
+        return (
+            "No Delphi/Lazarus IDE window found. Is RAD Studio running? "
+            "If it is, the window may have an unrecognised title — check "
+            "with list_app_windows."
+        )
+    try:
+        _bring_window_to_front(ide["hwnd"])
+    except Exception as e:  # pragma: no cover - win32 surface
+        return f"Found IDE window '{ide['title']}' but failed to focus it: {e}"
+    return f"Focused IDE window: {ide['title']} (hwnd={ide['hwnd']})"
+
+
+@mcp.tool()
 async def observe_ide(
     project_dir: str | None = None,
 ) -> list:

@@ -23,16 +23,20 @@ An MCP (Model Context Protocol) server that lets Claude compile, run, and intera
 |------|-------------|
 | `get_compiler_info` | Detect available compilers and show versions |
 | `compile_pascal` | Compile single-file source code |
-| `compile_delphi_project` | Compile proper Delphi project from templates (DPR + PAS + DFM) |
+| `compile_delphi_project` | Generate + compile a project from templates — `vcl`, `fmx` (cross-platform incl. Android), `console`, or `fpc` |
+| `build_dproj` | Build an existing `.dproj` via MSBuild + rsvars. Auto-resolves PAServer profile, chains Deploy, deep-cleans the dproj's actual output dirs, supports iOS deploy-manifest synthesis. See [§build_dproj details](#build_dproj-details) below |
 | `run_pascal` | Compile and execute console programs |
 | `launch_app` | Compile and launch GUI app in background |
 | `check_syntax` | Syntax check only (no linking) |
 | `parse_form` | Parse DFM/FMX/LFM form files |
+| `list_remote_profiles` | List PAServer Connection Profiles registered for iOS/macOS/Linux builds |
+| `check_ios_deploy` | Inspect a .dproj for the iOS DeployFile entries required by `/t:Deploy` |
 | `screenshot_app` | Capture screenshot of a running app window |
 | `list_app_windows` | List visible windows on the desktop |
 | `app_click` | Click on a Windows app window at screenshot pixel coordinates |
 | `app_type` | Type text into a Windows app window |
 | `app_key` | Send key or shortcut (e.g., `ctrl+a`, `enter`) to a Windows app |
+| `focus_ide` | Restore + foreground the Delphi/Lazarus IDE window |
 | `observe_ide` | Capture IDE screenshot and scan project files |
 | `read_ide_errors` | Read source code around compiler error locations |
 | `list_project_files` | List source files in a Delphi/Lazarus project |
@@ -50,6 +54,35 @@ An MCP (Model Context Protocol) server that lets Claude compile, run, and intera
 | `adb_push` | Push a file to the Android device |
 | `adb_pull` | Pull a file from the Android device |
 | `setup_fpc` | Download and install Free Pascal (fallback) |
+
+## build_dproj details
+
+`build_dproj` builds an **existing** real `.dproj` (multi-unit, with its own search paths, defines, resources, deployment) via MSBuild + `rsvars.bat`. It does the things ad-hoc shell calls to MSBuild keep getting wrong:
+
+- **Reads the dproj's own output paths.** Calls MSBuild against a tiny generated helper `.proj` that imports the dproj and emits `DCC_ExeOutput` / `DCC_DcuOutput` / `DCC_BplOutput` as the dproj's own evaluator sees them. Uses those for deep-clean targeting and artifact lookup — so `..\bin\$(Platform)\$(Config)` layouts work the same as the default.
+- **Auto-resolves the PAServer Connection Profile** for iOS / macOS / Linux builds by reading `HKCU\Software\Embarcadero\BDS\<ver>\RemoteProfiles`. When multiple compatible profiles exist (e.g. a `PRODUCTION` and `STAGING` Linux profile) it refuses to silently pick — caller has to pass `remote_profile=<name>` explicitly. Stops you accidentally deploying to production.
+- **Chains `/t:Build;Deploy`** automatically on Android / iOS / macOS / Linux so the build actually produces an APK or `.app`, not just an intermediate `libProj.so` or object file. Pass `deploy=False` to opt out.
+- **Detects + optionally synthesizes iOS DeployFile entries** that the IDE writes on first deploy. Without these 4 per-Config-Platform entries (`ProjectiOSEntitlements`, `ProjectiOSInfoPList`, `ProjectiOSLaunchScreen`, `ProjectOutput`) `/t:Deploy` ships nothing and codesign fails. `synthesize_ios_manifest=True` writes them after a timestamped `.bak` backup.
+- **Deep-cleans the platform's actual output dirs** before Rebuild/Clean on staging-based platforms (Android / iOS / macOS / Linux). MSBuild's own Clean leaves PAClient / PAServer staging in place, which is the root cause of "I changed the code but the APK didn't update" reports. Filters paths outside the project tree as a safety guard — never wipes the shared system BPL dir.
+
+### Working command-line recipe (matches what build_dproj does for you)
+
+```cmd
+rsvars.bat
+MSBuild <Proj>.dproj /t:Build  /p:Config=<Cfg> /p:Platform=<Plat>
+MSBuild <Proj>.dproj /t:Deploy /p:Config=<Cfg> /p:Platform=<Plat> /p:Profile=<ConnectionProfile>
+```
+
+`build_dproj` collapses this into a single call: `build_dproj(dproj_path, platform=<Plat>, config=<Cfg>)`.
+
+### Pre-flight check list
+
+If a build fails, walk through these before assuming the MCP is broken:
+
+- For iOS: did you ever IDE-deploy this project to this Config × Platform? If not, run `check_ios_deploy(dproj_path, config, platform)` and set `synthesize_ios_manifest=True` on the build.
+- For iOSSimARM64: is the iPhone**Simulator** SDK imported in *Tools → Manage Platforms*? (Importing the iPhoneOS *device* SDK doesn't satisfy the simulator link — `ld: file not found: /usr/lib/libiconv.dylib`.)
+- For any PAServer platform: `list_remote_profiles()` shows what's registered; sidecar `.profile` files must exist at `%APPDATA%\Embarcadero\BDS\<ver>\<name>.profile` for `/t:Deploy` to read them.
+- For Android: is `adb` on PATH? Is the device authorized (`adb_devices`)?
 
 ## Preview Bridge
 
