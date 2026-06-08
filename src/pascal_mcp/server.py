@@ -471,6 +471,7 @@ async def build_dproj(
     timeout: int = 600,
     deep_clean: bool | None = None,
     remote_profile: str | None = None,
+    deploy: bool | None = None,
 ) -> str:
     """Build an existing Delphi .dproj project file using MSBuild + rsvars.bat.
 
@@ -530,7 +531,17 @@ async def build_dproj(
             or Clean. True forces it on for any platform. False disables it.
         remote_profile: Name of the RAD Studio Connection Profile for PAServer.
             Required for iOS/macOS/Linux unless the .dproj pins a default.
-            Ignored for Win32/Win64/Android. Example: "MyMacMini".
+            Ignored for Win32/Win64/Android. Example: "MyMacMini". If omitted
+            on a PAServer platform, the tool auto-selects from registered
+            Connection Profiles when exactly one is compatible — multiple
+            matches force an explicit choice for safety (so a Linux Debug
+            build can't accidentally hit a "production" PAServer host).
+        deploy: Chain MSBuild's /t:Deploy after the requested target.
+            Required to produce a packaged artifact on Android (APK), iOS
+            (.app bundle + codesign), macOS (.app), and Linux (binary
+            staged on remote). None (default) auto-enables for those
+            platforms whenever target isn't Clean. False keeps the legacy
+            "compile and link only" behaviour. Ignored for Win32/Win64.
     """
     result = build_existing_dproj(
         dproj_path=dproj_path,
@@ -541,6 +552,7 @@ async def build_dproj(
         timeout=timeout,
         deep_clean=deep_clean,
         remote_profile=remote_profile,
+        deploy=deploy,
     )
 
     parts = [

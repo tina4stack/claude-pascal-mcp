@@ -1205,6 +1205,7 @@ def build_existing_dproj(
     timeout: int = 600,
     deep_clean: bool | None = None,
     remote_profile: str | None = None,
+    deploy: bool | None = None,
 ) -> CompileResult:
     """Build an existing Delphi .dproj using MSBuild + rsvars.bat.
 
@@ -1241,6 +1242,13 @@ def build_existing_dproj(
             and Android (Android builds locally). The profile itself must
             already exist in RAD Studio's config; this tool does not create
             profiles or store credentials.
+        deploy: Chain MSBuild's Deploy target after the Build. Required to
+            actually produce a packaged artifact on staging-based platforms —
+            /t:Build for Android only compiles libCuttlefishV2.so; the APK
+            is assembled by /t:Deploy via aapt + apksign. Same story for
+            iOS/macOS (.app bundle) and Linux. None (default) auto-enables
+            for any staging platform (Android/iOS/macOS/Linux) unless the
+            target is Clean. False keeps the old "compile only" behaviour.
 
     Returns:
         CompileResult with success flag, exit code, and combined output.
@@ -1334,19 +1342,42 @@ def build_existing_dproj(
     # work via deep_clean; still invoke MSBuild Clean for symmetry so the
     # in-tree DCU/.o files Delphi tracks get removed too.
 
+    # Auto-enable Deploy chaining for staging-based platforms — without it,
+    # Android Build only compiles libCuttlefishV2.so and never packages an
+    # APK; iOS/macOS Build emits the binary but Deploy is what assembles
+    # the .app bundle (and on iOS, ships it to PAServer for codesign).
+    # Win32/Win64 don't need Deploy. Clean obviously shouldn't chain Deploy.
+    if deploy is None:
+        deploy = (
+            _needs_staging_clean(platform)
+            and target.lower() not in ("clean",)
+        )
+
+    # Build the MSBuild target list. Chained with ';' so it runs in a single
+    # MSBuild invocation — one rsvars setup, one project load, one PAServer
+    # connection (Deploy reuses the same toolchain context as the preceding
+    # Build, which is critical for staging-based platforms).
+    target_list = [target]
+    if deploy and target.lower() != "deploy":
+        target_list.append("Deploy")
+    target_arg = ";".join(target_list)
+
     # Build the MSBuild command line. Properties are appended individually so
-    # we can conditionally include /p:RemoteProfileName for PAServer builds.
+    # we can conditionally include PAServer-related props.
     msbuild_props = [
         f"/p:Config={config}",
         f"/p:Platform={platform}",
     ]
     if remote_profile:
-        # The Delphi MSBuild targets read this to drive PAServer. Quote in
-        # case the profile name contains spaces.
+        # Delphi's targets read RemoteProfileName for the compile/link step
+        # and Profile for the Deploy step. They're semantically the same but
+        # different code paths inside CodeGear.*.Targets read each one — pass
+        # both to cover everything from /t:Build through /t:Deploy.
         msbuild_props.append(f'/p:RemoteProfileName="{remote_profile}"')
+        msbuild_props.append(f'/p:Profile="{remote_profile}"')
 
     msbuild_cmd = (
-        f'MSBuild "{project_file}" /t:{target} '
+        f'MSBuild "{project_file}" /t:{target_arg} '
         + " ".join(msbuild_props)
         + " /nologo /verbosity:minimal"
     )
@@ -1426,10 +1457,15 @@ def build_existing_dproj(
     elif remote_profile:
         paserver_log = f"PAServer profile: {remote_profile} (explicit)\n\n"
 
+    # Note in the trace which targets were actually invoked, so it's obvious
+    # when Deploy ran (or didn't) without the caller having to parse
+    # MSBuild's output.
+    target_log = f"MSBuild targets: {target_arg}\n\n"
+
     return CompileResult(
         success=success,
         exit_code=proc.returncode,
-        stdout=paserver_log + dproj_log + clean_log + (proc.stdout or ""),
+        stdout=target_log + paserver_log + dproj_log + clean_log + (proc.stdout or ""),
         stderr=proc.stderr,
         compiler_used=f"MSBuild ({platform} {config}) via {os.path.basename(studio_root)}",
         exe_path=exe_path,
