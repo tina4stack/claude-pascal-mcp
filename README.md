@@ -40,6 +40,14 @@ An MCP (Model Context Protocol) server that lets Claude compile, run, and intera
 | `ios_codesign` | Codesign an .app bundle on the remote Mac (paclient -c) |
 | `ios_create_ipa` | Assemble a signed .app into an .ipa (paclient -i) |
 | `ios_install_ipa` | Install an .ipa on an iOS device attached to the Mac (paclient -ii) |
+| `mac_ssh_check` | Probe SSH connectivity + key auth to the remote Mac |
+| `mac_ssh_run` | Run an arbitrary command on the Mac via SSH (xcrun, logging, etc.) |
+| `sim_list` | List iOS simulators known to the Mac (xcrun simctl list) |
+| `sim_boot` / `sim_shutdown` | Boot or shut down a simulator by UDID |
+| `sim_install` / `sim_uninstall` | Install / uninstall a .app on a simulator |
+| `sim_launch` / `sim_terminate` | Launch or terminate an app by bundle ID |
+| `sim_open_url` | Open a URL in the simulator (deep links, web) |
+| `sim_screenshot` | Capture a simulator screenshot as Image (parity with `adb_screenshot`) |
 | `screenshot_app` | Capture screenshot of a running app window |
 | `list_app_windows` | List visible windows on the desktop |
 | `app_click` | Click on a Windows app window at screenshot pixel coordinates |
@@ -121,6 +129,27 @@ By default PAServer rejects any file op outside its per-profile scratch dir:
 ```
 
 Targeting `/tmp` or `/Users/anything-else` returns `Error: E0006 ... PAServer is running in restricted mode`. Either point your transfer at the scratch dir (`paserver_scratch_dir` composes the path) or have the host operator start PAServer with `-restricted=false`.
+
+### iOS Simulator via SSH
+
+`xcrun simctl` runs on the Mac and PAClient doesn't expose arbitrary command execution, so simulator control goes through SSH. One-time setup on the Windows side:
+
+```bash
+# Enable Remote Login on the Mac: System Settings → General → Sharing → Remote Login.
+# Then install your public key (asks for the Mac password once):
+ssh-copy-id <mac_user>@<mac_host>
+```
+
+Once that's done, the `sim_*` tools have parity with `adb_*` — same verbs, same return shape:
+
+```python
+mac_ssh_check("192.168.88.79", "andrevanzuydam")   # pre-flight
+sim_list(host, user, booted_only=True)              # what's running?
+sim_boot(host, user, "<UDID>")
+sim_install(host, user, "/Users/.../scratch-dir/...-MACBOOK/MyApp.app")
+sim_launch(host, user, "com.embarcadero.MyApp")
+sim_screenshot(host, user)                          # returns an Image
+```
 
 ### Full iOS deploy recipe
 

@@ -99,7 +99,14 @@ mcp = FastMCP(
         "files (PAServer's restricted mode means writes go in the per-profile "
         "scratch dir — paserver_scratch_dir composes it). After a build_dproj "
         "for iOS leaves a .app in scratch, ios_codesign / ios_create_ipa / "
-        "ios_install_ipa wrap the codesign + IPA + device-install pipeline."
+        "ios_install_ipa wrap the codesign + IPA + device-install pipeline. "
+        "iOS SIMULATOR: PAClient does not control xcrun simctl, so simulator "
+        "operations go through SSH-to-Mac instead. Use sim_list / sim_boot / "
+        "sim_install / sim_launch / sim_terminate / sim_uninstall / "
+        "sim_open_url / sim_screenshot — same surface as the adb_* tools. "
+        "Generic remote command execution is mac_ssh_run; mac_ssh_check is "
+        "the pre-flight. SSH key auth must be configured once with "
+        "`ssh-copy-id <user>@<host>` — these tools never accept passwords."
     ),
 )
 
@@ -890,6 +897,156 @@ async def paserver_put(
     if r.errors:
         body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
     return head + body
+
+
+@mcp.tool()
+async def mac_ssh_check(host: str, user: str, key_path: str | None = None) -> str:
+    """Test SSH connectivity + key auth to the remote Mac.
+
+    Runs `whoami` over SSH with BatchMode (no interactive prompts) and
+    verifies we land on the expected account. If key auth isn't set up,
+    returns the exact ssh-copy-id command to fix it.
+
+    Args:
+        host: Mac hostname or IP (use the same address as the PAServer
+            profile's Host field — see paserver_info).
+        user: Mac user account.
+        key_path: Optional explicit SSH private key path.
+    """
+    from pascal_mcp.mac_ssh import ssh_check
+    ok, msg = ssh_check(host, user, key_path=key_path)
+    return ("OK\n" if ok else "FAIL\n") + msg
+
+
+@mcp.tool()
+async def mac_ssh_run(
+    host: str, user: str, command: str,
+    key_path: str | None = None, timeout: int = 60,
+) -> str:
+    """Run an arbitrary command on the remote Mac via SSH.
+
+    The building block for any Mac-side operation that paclient.exe doesn't
+    cover (xcrun simctl, devicectl, log inspection, log streaming, etc.).
+    Most callers should prefer the sim_* tools that wrap simctl directly;
+    use this when you need something specific that doesn't have a wrapper.
+
+    Args:
+        host: Mac hostname or IP.
+        user: Mac user account.
+        command: Single command line. Quote internal spaces yourself.
+        key_path: Optional explicit SSH private key path.
+        timeout: Seconds before killed.
+    """
+    from pascal_mcp.mac_ssh import ssh_run
+    return ssh_run(host, user, command, key_path=key_path, timeout=timeout).summarise()
+
+
+@mcp.tool()
+async def sim_list(
+    host: str, user: str, booted_only: bool = False,
+    key_path: str | None = None,
+) -> str:
+    """List iOS simulators on the Mac (xcrun simctl list devices --json).
+
+    Returns the raw simctl JSON so the caller can pick UDIDs / runtime
+    versions / names. Pass booted_only=True to filter to currently-running.
+    """
+    from pascal_mcp.ios_sim import sim_list as do_list
+    return do_list(host, user, booted_only=booted_only, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_boot(host: str, user: str, udid: str, key_path: str | None = None) -> str:
+    """Boot a simulator by UDID (xcrun simctl boot)."""
+    from pascal_mcp.ios_sim import sim_boot as do_boot
+    return do_boot(host, user, udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_shutdown(
+    host: str, user: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Shut down a simulator. Pass udid='booted' to stop all running ones."""
+    from pascal_mcp.ios_sim import sim_shutdown as do_shutdown
+    return do_shutdown(host, user, udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_install(
+    host: str, user: str, app_path: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Install a .app bundle on a simulator (xcrun simctl install).
+
+    app_path is the path on the Mac. After a build_dproj for iOSSimARM64
+    with deploy chained, the .app lives in PAServer's scratch dir —
+    use paserver_scratch_dir + the project name to compose it.
+    """
+    from pascal_mcp.ios_sim import sim_install as do_install
+    return do_install(host, user, app_path, udid=udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_launch(
+    host: str, user: str, bundle_id: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Launch an installed app by bundle identifier (xcrun simctl launch)."""
+    from pascal_mcp.ios_sim import sim_launch as do_launch
+    return do_launch(host, user, bundle_id, udid=udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_terminate(
+    host: str, user: str, bundle_id: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Terminate a running app by bundle identifier."""
+    from pascal_mcp.ios_sim import sim_terminate as do_terminate
+    return do_terminate(host, user, bundle_id, udid=udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_uninstall(
+    host: str, user: str, bundle_id: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Uninstall an app from a simulator."""
+    from pascal_mcp.ios_sim import sim_uninstall as do_uninstall
+    return do_uninstall(host, user, bundle_id, udid=udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_open_url(
+    host: str, user: str, url: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> str:
+    """Open a URL in the simulator (deep link or web URL)."""
+    from pascal_mcp.ios_sim import sim_open_url as do_open
+    return do_open(host, user, url, udid=udid, key_path=key_path).summarise()
+
+
+@mcp.tool()
+async def sim_screenshot(
+    host: str, user: str, udid: str = "booted",
+    key_path: str | None = None,
+) -> Image | str:
+    """Capture a simulator screenshot and return it as an Image (parity with adb_screenshot).
+
+    Pipes through base64 over SSH so we don't need a separate scp step.
+    Returns an Image on success, or an error string on failure.
+    """
+    import base64 as _b64
+    from pascal_mcp.ios_sim import sim_screenshot_b64
+    result = sim_screenshot_b64(host, user, udid=udid, key_path=key_path)
+    if not result.success:
+        return result.summarise()
+    try:
+        png = _b64.b64decode(result.stdout)
+    except Exception as e:
+        return f"sim_screenshot succeeded but base64 decode failed: {e}"
+    return Image(data=png, format="png")
 
 
 @mcp.tool()
