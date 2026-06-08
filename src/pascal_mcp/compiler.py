@@ -3,12 +3,21 @@
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+# Registry access — Windows-only stdlib module. The build_dproj/PAServer code
+# paths only run on Windows anyway (rsvars.bat is Windows), but guard the
+# import so the module can still be loaded on Linux/macOS for the FPC path.
+if sys.platform == "win32":
+    import winreg  # type: ignore[import-not-found]
+else:  # pragma: no cover - non-Windows fallback
+    winreg = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -695,6 +704,194 @@ def _discover_studio_roots() -> list[str]:
     return sorted([r for r in roots if os.path.isdir(r)], reverse=True)
 
 
+def _studio_version_from_root(studio_root: str) -> str | None:
+    """Extract 'XX.Y' (e.g. '37.0') from a studio install root path.
+
+    Used as the key into HKCU\\Software\\Embarcadero\\BDS\\<version> and the
+    %APPDATA%\\Embarcadero\\BDS\\<version> sidecar dir. Returns None if the
+    path doesn't end in a version-shaped segment.
+    """
+    base = os.path.basename(os.path.normpath(studio_root))
+    return base if re.fullmatch(r"\d+\.\d+", base) else None
+
+
+@dataclass
+class RemoteProfile:
+    """A RAD Studio Connection Profile entry pointing at a PAServer host."""
+    name: str
+    platform: str  # Platform tag the IDE uses to filter dropdown (OSX64 etc.)
+    hostname: str
+    port: int
+    profile_file_exists: bool  # %APPDATA%\\...\\<name>.profile sidecar
+
+
+def _profile_sidecar_path(name: str, version: str) -> str:
+    """Return the absolute path to the .profile sidecar file Deploy reads.
+
+    Without this file Deploy aborts with 'Missing profile name', even when
+    the registry entry is present. The IDE writes it; command-line tooling
+    won't.
+    """
+    appdata = os.environ.get("APPDATA", "")
+    return os.path.join(appdata, "Embarcadero", "BDS", version, f"{name}.profile")
+
+
+def _discover_remote_profiles(version: str) -> list[RemoteProfile]:
+    """Read all Connection Profiles from HKCU registry for a Studio version.
+
+    Returns an empty list on non-Windows or if no profiles are registered.
+    Each profile records whether its sidecar file is present so callers can
+    quickly filter out half-configured entries.
+    """
+    if winreg is None:
+        return []
+
+    profiles: list[RemoteProfile] = []
+    key_path = rf"SOFTWARE\Embarcadero\BDS\{version}\RemoteProfiles"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path)
+    except FileNotFoundError:
+        return []
+
+    try:
+        num_subkeys, _, _ = winreg.QueryInfoKey(root)
+        for i in range(num_subkeys):
+            name = winreg.EnumKey(root, i)
+            try:
+                sub = winreg.OpenKey(root, name)
+            except OSError:
+                continue
+            try:
+                vals: dict[str, object] = {}
+                _, num_vals, _ = winreg.QueryInfoKey(sub)
+                for j in range(num_vals):
+                    vname, vdata, _ = winreg.EnumValue(sub, j)
+                    vals[vname] = vdata
+            finally:
+                winreg.CloseKey(sub)
+
+            try:
+                port = int(vals.get("PortNumber") or 64211)
+            except (TypeError, ValueError):
+                port = 64211
+            profiles.append(RemoteProfile(
+                name=name,
+                platform=str(vals.get("Platform", "") or ""),
+                hostname=str(vals.get("HostName", "") or ""),
+                port=port,
+                profile_file_exists=os.path.isfile(_profile_sidecar_path(name, version)),
+            ))
+    finally:
+        winreg.CloseKey(root)
+
+    return profiles
+
+
+# Which profile.Platform tags are usable for which build platform. PAServer
+# itself is platform-agnostic — a single Mac host serves OSX64, OSXARM64,
+# iOSDevice64, iOSSimARM64 alike — but the IDE tags profiles with one
+# platform for the dropdown. We accept any Apple-side tag for Apple targets.
+_PROFILE_PLATFORM_COMPAT: dict[str, tuple[str, ...]] = {
+    "ios": ("iOSDevice64", "iOSSimARM64", "iOSSimulator", "OSX64", "OSXARM64"),
+    "osx": ("OSX64", "OSXARM64"),
+    "linux": ("Linux64",),
+}
+
+
+def _compatible_profile_platforms(target_platform: str) -> tuple[str, ...]:
+    p = target_platform.lower()
+    for prefix, allowed in _PROFILE_PLATFORM_COMPAT.items():
+        if p.startswith(prefix):
+            return allowed
+    return ()
+
+
+def _resolve_remote_profile(
+    target_platform: str,
+    version: str,
+    explicit: str | None = None,
+) -> tuple[str | None, str]:
+    """Pick a Connection Profile to use for a PAServer build.
+
+    Returns (profile_name, reason). reason is always a single human-readable
+    line suitable for echoing into the build trace. profile_name is None
+    when the platform doesn't need a profile, or when nothing usable was
+    found and the caller should surface the reason as a warning.
+
+    Rules:
+      - explicit always wins, but we still verify the .profile sidecar
+        and downgrade to a warning if it's missing.
+      - Otherwise filter discovered profiles by Platform-compat for the
+        target, drop entries with missing sidecars, return the first.
+      - On total miss, the reason string lists what IS available so the
+        user can either pick one or open Connection Profile Manager.
+    """
+    if not _compatible_profile_platforms(target_platform):
+        return None, f"platform {target_platform} doesn't use a remote profile"
+
+    if explicit:
+        if os.path.isfile(_profile_sidecar_path(explicit, version)):
+            return explicit, f"using explicit profile '{explicit}'"
+        return explicit, (
+            f"using explicit profile '{explicit}' "
+            f"(WARNING: no sidecar file at {_profile_sidecar_path(explicit, version)} "
+            "— Deploy will likely fail with 'Missing profile name')"
+        )
+
+    profiles = _discover_remote_profiles(version)
+    if not profiles:
+        return None, (
+            f"no remote profiles registered under HKCU\\Software\\Embarcadero\\BDS\\{version}"
+            "\\RemoteProfiles. Open RAD Studio → Tools → Options → Environment Options "
+            "→ Connection Profile Manager to add one."
+        )
+
+    compat = _compatible_profile_platforms(target_platform)
+    matches = [p for p in profiles if p.platform in compat]
+    valid = sorted(
+        [p for p in matches if p.profile_file_exists], key=lambda p: p.name
+    )
+
+    if len(valid) == 1:
+        chosen = valid[0]
+        return chosen.name, (
+            f"auto-selected '{chosen.name}' "
+            f"(Platform={chosen.platform}, Host={chosen.hostname}:{chosen.port})"
+        )
+
+    if len(valid) > 1:
+        # Safety: refuse to pick silently. Production-named profiles must not
+        # be auto-selected — the user has to mean it. Listing all candidates
+        # so they can pass remote_profile=... explicitly.
+        listing = ", ".join(
+            f"'{p.name}' (Host={p.hostname}:{p.port})" for p in valid
+        )
+        return None, (
+            f"multiple profiles compatible with {target_platform}: {listing}. "
+            "Refusing to auto-select — pass remote_profile=<name> explicitly "
+            "so we don't accidentally deploy to the wrong host."
+        )
+
+    # Fall through: nothing usable. Build a diagnostic listing.
+    if matches:
+        listing = ", ".join(
+            f"'{p.name}' (sidecar MISSING)" for p in matches
+        )
+        return None, (
+            f"profiles matching {target_platform} exist but have no sidecar "
+            f".profile file: {listing}. The sidecar is written when the profile "
+            "is opened in Connection Profile Manager — open and save it once."
+        )
+
+    avail = ", ".join(f"'{p.name}' (Platform={p.platform})" for p in profiles)
+    return None, (
+        f"no profile in registry is compatible with {target_platform}. "
+        f"Compatible profile.Platform values: {compat}. "
+        f"Available profiles: {avail or '(none)'}. "
+        "Create one in Connection Profile Manager."
+    )
+
+
 # Platforms that build through a staging directory + external packager
 # (Android via aapt locally; iOS / OSX / Linux via PAServer on a remote host).
 # These all share the "Delphi's Clean target leaves stale staging behind" bug
@@ -1084,6 +1281,22 @@ def build_existing_dproj(
     project_file = os.path.basename(dproj_path)
     project_name = os.path.splitext(project_file)[0]
 
+    # Auto-resolve a PAServer Connection Profile when the platform needs one
+    # and the caller didn't pin a specific name. We always run this so the
+    # build trace shows which profile was picked (or why none was), even when
+    # the user passed one explicitly.
+    studio_version = _studio_version_from_root(studio_root)
+    profile_reason: str = ""
+    if studio_version and _needs_paserver(platform):
+        resolved, profile_reason = _resolve_remote_profile(
+            platform, studio_version, explicit=remote_profile,
+        )
+        if resolved is not None:
+            remote_profile = resolved
+        # If resolution failed and the user didn't supply an explicit value,
+        # remote_profile stays None and the trace will surface profile_reason
+        # alongside the existing PAServer warning.
+
     # Source-of-truth: ask MSBuild to evaluate the dproj's own output paths
     # for this Config/Platform. Used by deep_clean and artifact resolution
     # so both honour the project's actual configuration instead of guessing
@@ -1205,20 +1418,13 @@ def build_existing_dproj(
         rows = [f"  {k}: {v}" for k, v in dproj_paths.items()]
         dproj_log = "Dproj output paths (resolved by MSBuild):\n" + "\n".join(rows) + "\n\n"
 
-    # PAServer info: surface the profile used, and warn if the platform needs
-    # one but none was passed (the .dproj may still have a default pinned).
+    # PAServer info: surface the profile used (or the resolution diagnostic
+    # when nothing was selectable).
     paserver_log = ""
-    if remote_profile:
-        paserver_log = f"PAServer profile: {remote_profile}\n\n"
-    elif _needs_paserver(platform):
-        paserver_log = (
-            f"Note: platform {platform} normally builds via PAServer. No "
-            "remote_profile was supplied, so the build will use whatever "
-            "RemoteProfileName the .dproj pins by default. If it fails with "
-            '"E2597 No remote profile" or a connection error, pass '
-            "remote_profile=<your-profile-name> and make sure PAServer is "
-            "running on the target host.\n\n"
-        )
+    if profile_reason:
+        paserver_log = f"PAServer profile: {profile_reason}\n\n"
+    elif remote_profile:
+        paserver_log = f"PAServer profile: {remote_profile} (explicit)\n\n"
 
     return CompileResult(
         success=success,

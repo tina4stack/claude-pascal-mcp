@@ -10,6 +10,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
 from pascal_mcp.compiler import (
+    _discover_remote_profiles,
+    _discover_studio_roots,
+    _studio_version_from_root,
     build_existing_dproj,
     cleanup_compile_result,
     compile_and_launch,
@@ -563,6 +566,61 @@ async def build_dproj(
         parts.append("\n--- MSBuild Stderr ---\n" + err)
 
     return "\n".join(parts)
+
+
+@mcp.tool()
+async def list_remote_profiles(studio_root: str | None = None) -> str:
+    """List PAServer Connection Profiles registered in this RAD Studio install.
+
+    These profiles drive iOS / macOS / Linux builds via PAServer on a remote
+    Mac or Linux host. build_dproj uses them automatically (it picks the first
+    compatible profile for the target platform), but listing them is useful
+    when troubleshooting a "Missing profile name" or "No remote profile"
+    error from MSBuild Deploy.
+
+    Each profile lists:
+      - Name (what you pass as remote_profile=)
+      - Platform tag (OSX64, iOSDevice64, Linux64 — used to filter for the
+        target. An OSX64 profile is reusable for any Apple target.)
+      - Host:port (where PAServer is listening)
+      - Whether the sidecar .profile file exists at
+        %APPDATA%\\Embarcadero\\BDS\\<ver>\\<name>.profile. The sidecar is
+        REQUIRED for Deploy to read the profile — if missing, open the
+        profile in Connection Profile Manager once to write it.
+
+    Args:
+        studio_root: Optional RAD Studio install root (e.g.
+            r"C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0"). Defaults
+            to the highest-version install detected.
+    """
+    if studio_root is None:
+        roots = _discover_studio_roots()
+        if not roots:
+            return "No RAD Studio installation found."
+        studio_root = roots[0]
+
+    version = _studio_version_from_root(studio_root)
+    if version is None:
+        return f"Could not determine Studio version from path: {studio_root}"
+
+    profiles = _discover_remote_profiles(version)
+    if not profiles:
+        return (
+            f"No PAServer profiles registered under HKCU\\Software\\Embarcadero"
+            f"\\BDS\\{version}\\RemoteProfiles.\n\n"
+            "Open RAD Studio → Tools → Options → Environment Options → "
+            "Connection Profile Manager to add one."
+        )
+
+    lines = [f"RAD Studio {version} — {len(profiles)} connection profile(s):", ""]
+    for p in profiles:
+        sidecar = "OK" if p.profile_file_exists else "MISSING — Deploy will fail"
+        lines.append(f"  {p.name}")
+        lines.append(f"    Platform tag: {p.platform}")
+        lines.append(f"    Host:         {p.hostname}:{p.port}")
+        lines.append(f"    Sidecar file: {sidecar}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 @mcp.tool()
