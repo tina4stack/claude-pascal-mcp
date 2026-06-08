@@ -491,6 +491,15 @@ async def build_dproj(
     platform's intermediate and bin directories before invoking MSBuild.
     Pass deep_clean=False to disable, or deep_clean=True to force it.
 
+    OUTPUT PATHS: this tool reads the .dproj's own DCC_ExeOutput / DCC_DcuOutput
+    / DCC_BplOutput properties (resolved by MSBuild, honouring conditional
+    PropertyGroups, $(Platform)/$(Config) substitution, base config inheritance,
+    etc.) and uses those for both deep_clean and artifact resolution. So if your
+    dproj points outputs at ..\\bin\\$(Platform)\\$(Config) or anywhere else
+    non-default, this tool follows. Safe guard: paths resolving outside the
+    project tree (e.g. the shared C:\\Users\\Public\\...\\Bpl\\ system dir) are
+    NEVER deep-cleaned; the trace will list them as "Skipped".
+
     PASERVER (iOS / macOS / Linux): cross-builds for these platforms run
     through PAServer on a remote Mac or Linux host. Pass remote_profile
     with the name of a Connection Profile already configured in RAD Studio

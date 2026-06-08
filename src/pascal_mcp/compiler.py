@@ -1,6 +1,7 @@
 """Pascal compiler detection, compilation, and execution."""
 
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -728,62 +729,273 @@ def _artifact_extension(platform: str) -> str:
     return ".exe"
 
 
-def _resolve_artifact_path(
-    project_dir: str, project_name: str, platform: str, config: str
-) -> str | None:
-    """Look in the conventional locations where Delphi drops the output artifact.
+_DPROJ_PROPS_TO_READ = ("DCC_ExeOutput", "DCC_DcuOutput", "DCC_BplOutput")
 
-    Different Delphi versions and project configurations use different output
-    layouts. We probe the common candidates and return the first one that exists.
+# Helper .proj that imports the dproj and emits each property on a tagged line
+# so we can parse it back out. Works on MSBuild 4.0+ (what RAD Studio ships)
+# unlike the newer `/getProperty` switch.
+_PROPS_HELPER_TEMPLATE = """<Project DefaultTargets="GetProps" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="{dproj_full}" />
+  <Target Name="GetProps">
+{messages}
+  </Target>
+</Project>
+"""
+
+
+def _resolve_dproj_paths(
+    rsvars: str,
+    dproj_path: str,
+    config: str,
+    platform: str,
+    remote_profile: str | None = None,
+    timeout: int = 60,
+) -> dict[str, str]:
+    """Ask MSBuild to evaluate the .dproj's own output directories for this build.
+
+    Source of truth for where the build will actually drop its artifacts. We
+    write a tiny helper .proj that <Import>s the dproj and emits each desired
+    property via <Message>; MSBuild runs the dproj's full property evaluator
+    so every $(Platform), $(Config), conditional PropertyGroup, base config,
+    and inherited override is resolved exactly as Delphi would.
+
+    Returns a dict mapping any of:
+      DCC_ExeOutput, DCC_DcuOutput, DCC_BplOutput
+    to an absolute Windows path. Empty dict on any failure — callers fall
+    back to convention-based path probing.
+
+    Why not `MSBuild /getProperty:...`? That switch needs MSBuild 16.8+
+    (VS 2019). RAD Studio bundles MSBuild 4.0, which rejects it as
+    `MSB1001: Unknown switch`. The import-trick works everywhere.
+    """
+    project_dir = os.path.dirname(dproj_path)
+    dproj_full = os.path.abspath(dproj_path)
+
+    # Build the helper .proj. Tag each Message with a sentinel so we can
+    # cleanly extract values even when MSBuild interleaves Build noise.
+    messages = "\n".join(
+        f'    <Message Text="===PROP {p}=$({p})===" Importance="High" />'
+        for p in _DPROJ_PROPS_TO_READ
+    )
+    helper_proj = _PROPS_HELPER_TEMPLATE.format(
+        dproj_full=dproj_full, messages=messages
+    )
+
+    proj_fd, proj_path = tempfile.mkstemp(
+        suffix=".proj", prefix="getprops_", text=True
+    )
+    bat_fd, bat_path = tempfile.mkstemp(suffix=".bat", text=True)
+    try:
+        with os.fdopen(proj_fd, "w") as f:
+            f.write(helper_proj)
+        with os.fdopen(bat_fd, "w") as f:
+            f.write("@echo off\r\n")
+            f.write(f'call "{rsvars}"\r\n')
+            # Run from project_dir so any relative imports inside the dproj
+            # (e.g. CodeGear.Delphi.Targets paths) resolve correctly.
+            f.write(f'cd /d "{project_dir}"\r\n')
+            cmd = (
+                f'MSBuild "{proj_path}" /nologo '
+                f"/p:Config={config} /p:Platform={platform} "
+                "/v:minimal /clp:NoSummary"
+            )
+            if remote_profile:
+                cmd += (
+                    f' /p:RemoteProfileName="{remote_profile}"'
+                    f' /p:Profile="{remote_profile}"'
+                )
+            f.write(cmd + "\r\n")
+
+        try:
+            proc = subprocess.run(
+                ["cmd.exe", "/c", bat_path],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {}
+    finally:
+        for p in (bat_path, proj_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # Even on warnings the Message lines should print. Only bail on hard fail.
+    if proc.returncode != 0 and not proc.stdout:
+        return {}
+
+    result: dict[str, str] = {}
+    # Sentinel-delimited lines look like: "===PROP DCC_ExeOutput=..\bin\Win32\Debug==="
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("===PROP ") or not line.endswith("==="):
+            continue
+        body = line[len("===PROP "):-3]
+        if "=" not in body:
+            continue
+        key, _, val = body.partition("=")
+        if key not in _DPROJ_PROPS_TO_READ or not val:
+            continue
+        # Resolve relative paths (commonly "..\\bin\\<Platform>\\<Config>")
+        # against the project dir and canonicalise.
+        result[key] = os.path.abspath(os.path.join(project_dir, val))
+    return result
+
+
+def _resolve_artifact_path(
+    project_dir: str,
+    project_name: str,
+    platform: str,
+    config: str,
+    exe_output_dir: str | None = None,
+) -> str | None:
+    """Locate the build artifact. Prefer the dproj's own DCC_ExeOutput.
+
+    If exe_output_dir is provided (from _resolve_dproj_paths), probe it first
+    with the platform-conventional extension. Otherwise fall back to the
+    legacy candidate list — covers older code paths and projects where the
+    /getProperty call failed.
     """
     ext = _artifact_extension(platform)
     name = project_name + ext
 
-    candidates = [
-        # Newer common convention with explicit bin\ prefix
+    candidates: list[str] = []
+
+    # Authoritative path from the dproj, if we got it
+    if exe_output_dir:
+        candidates.extend([
+            os.path.join(exe_output_dir, name),
+            # Android: aapt nests the APK under <Name>\bin\<Name>.apk
+            os.path.join(exe_output_dir, project_name, "bin", name),
+        ])
+
+    # Convention-based fallback (last-resort guesses)
+    candidates.extend([
         os.path.join(project_dir, "bin", platform, config, name),
-        # Default Delphi output layout
         os.path.join(project_dir, platform, config, name),
-        # Android: Delphi nests through a staging subdir before APK packaging
         os.path.join(project_dir, platform, config, project_name, "bin", name),
         os.path.join(project_dir, "bin", platform, config, project_name, "bin", name),
-    ]
+        # ..\bin\ convention used by many real projects (Cuttlefish-style)
+        os.path.abspath(os.path.join(project_dir, "..", "bin", platform, config, name)),
+        os.path.abspath(os.path.join(project_dir, "..", platform, config, name)),
+    ])
+
     for c in candidates:
         if os.path.exists(c):
             return c
     return None
 
 
-def _deep_clean_platform_dirs(
-    project_dir: str, platform: str, config: str
-) -> list[str]:
-    """Nuke the intermediate + final output dirs for a given platform/config.
+def _is_safe_clean_target(target: str, project_dir: str) -> bool:
+    """Decide whether ``target`` is safe to deep-clean.
 
-    Delphi's own MSBuild Clean / Rebuild targets do NOT fully clean the Android
-    pipeline. They wipe DCU and .o files but leave behind:
+    Safety rules — all must hold:
+      1. target must be inside the project tree, i.e. under project_dir OR
+         under the project's parent directory (covers ..\\bin\\, ..\\dcu\\,
+         ..\\pkg\\ layouts).
+      2. target must NOT be project_dir itself or the parent_dir itself.
+      3. target must NOT be the project's immediate sibling source dir
+         (we only delete platform/config-specific output subdirs).
 
-      - The PAClient staging directory under <Platform>\\<Config>\\<ProjectName>\\
-        (stale assets, libs, classes, AndroidManifest.xml). These are repackaged
-        into the next APK, which is why "I changed the code but the APK didn't
-        update" complaints happen.
-      - The previous APK at bin\\<Platform>\\<Config>\\<ProjectName>.apk.
-      - The classes.dex / R.java / aapt caches.
-
-    This helper removes the per-config subdirectories so the next build starts
-    from a clean slate. It does NOT touch source files, the .dproj, or sibling
-    config directories (e.g. running Debug clean leaves Release alone).
-
-    Returns the list of directories that were removed (or attempted).
+    The most important case this rejects: shared system BPL directories
+    like C:\\Users\\Public\\Documents\\Embarcadero\\Studio\\37.0\\Bpl\\<Platform>,
+    which hold BPLs from every Delphi project on the machine. Nuking them
+    would break every other project.
     """
-    targets = [
-        os.path.join(project_dir, platform, config),
-        os.path.join(project_dir, "bin", platform, config),
-    ]
+    norm_target = os.path.normpath(os.path.abspath(target))
+    norm_project = os.path.normpath(os.path.abspath(project_dir))
+    norm_parent = os.path.normpath(os.path.dirname(norm_project))
+
+    if norm_target in (norm_project, norm_parent):
+        return False
+
+    # commonpath returns the common ancestor; if it's the project tree, ok.
+    try:
+        cp_project = os.path.commonpath([norm_target, norm_project])
+    except ValueError:
+        cp_project = ""
+    try:
+        cp_parent = os.path.commonpath([norm_target, norm_parent])
+    except ValueError:
+        cp_parent = ""
+
+    return cp_project == norm_project or cp_parent == norm_parent
+
+
+def _deep_clean_platform_dirs(
+    project_dir: str,
+    platform: str,
+    config: str,
+    dproj_paths: dict[str, str] | None = None,
+) -> list[str]:
+    """Nuke the intermediate + final output dirs for this Config/Platform.
+
+    Delphi's own MSBuild Clean / Rebuild target wipes the DCU files it tracks
+    but leaves the PAClient/PAServer staging directory and the previous
+    artifact in place. The next build repackages those stale files into the
+    new APK / .app / ELF, producing the classic "I changed the code but the
+    artifact didn't update" symptom.
+
+    Source of truth: the .dproj's own DCC_ExeOutput, DCC_DcuOutput, and
+    DCC_BplOutput properties (resolved via MSBuild against the dproj into
+    dproj_paths). We nuke exactly those directories, not assumed conventions.
+
+    Falls back to conventional dirs only if dproj_paths is empty (e.g. the
+    resolver call failed). The convention list now also includes the
+    ..\\bin\\<Platform>\\<Config> layout common in real projects, which the
+    previous version missed entirely.
+
+    Safety: every candidate is filtered through _is_safe_clean_target so we
+    never wipe a shared system directory (e.g. the shared BPL output at
+    C:\\Users\\Public\\Documents\\Embarcadero\\Studio\\37.0\\Bpl\\<Platform>,
+    which DCC_BplOutput often resolves to and which holds BPLs from every
+    Delphi project on the machine).
+
+    Sibling configs (Debug vs Release) and sibling platforms are never
+    touched: each property already resolves to a Config-and-Platform-specific
+    subdirectory.
+
+    Returns the list of directories that were removed.
+    """
+    targets: list[str] = []
+    seen: set[str] = set()
+    rejected: list[str] = []
+
+    def _add(path: str) -> None:
+        n = os.path.normpath(path)
+        if n in seen:
+            return
+        seen.add(n)
+        if _is_safe_clean_target(n, project_dir):
+            targets.append(n)
+        else:
+            rejected.append(n)
+
+    if dproj_paths:
+        # Authoritative: use the dproj's own output dirs.
+        for key in _DPROJ_PROPS_TO_READ:
+            p = dproj_paths.get(key)
+            if p:
+                _add(p)
+
+    # Always include the conventional fallbacks too — covers the case where
+    # the resolver missed something or the dproj has additional intermediate
+    # dirs (e.g. PAClient/PAServer scratch parallel to the named outputs).
+    _add(os.path.join(project_dir, platform, config))
+    _add(os.path.join(project_dir, "bin", platform, config))
+    _add(os.path.abspath(os.path.join(project_dir, "..", "bin", platform, config)))
+    _add(os.path.abspath(os.path.join(project_dir, "..", "dcu", platform, config)))
+
     removed: list[str] = []
     for t in targets:
         if os.path.isdir(t):
             shutil.rmtree(t, ignore_errors=True)
             removed.append(t)
+
+    # Stash rejected paths on a module-level for the build wrapper to log.
+    # Threading them through the return signature would force every caller
+    # to handle a new shape; an attribute on the function keeps backward compat.
+    _deep_clean_platform_dirs._last_rejected = rejected  # type: ignore[attr-defined]
     return removed
 
 
@@ -872,6 +1084,19 @@ def build_existing_dproj(
     project_file = os.path.basename(dproj_path)
     project_name = os.path.splitext(project_file)[0]
 
+    # Source-of-truth: ask MSBuild to evaluate the dproj's own output paths
+    # for this Config/Platform. Used by deep_clean and artifact resolution
+    # so both honour the project's actual configuration instead of guessing
+    # bin\<Platform>\<Config> when the dproj might point at ..\bin\... or
+    # somewhere else entirely.
+    dproj_paths = _resolve_dproj_paths(
+        rsvars=rsvars,
+        dproj_path=dproj_path,
+        config=config,
+        platform=platform,
+        remote_profile=remote_profile,
+    )
+
     # Auto-enable deep clean for any staging-based platform on Rebuild/Clean.
     # Delphi's own Clean target wipes DCUs but leaves PAClient / PAServer
     # staging dirs intact, which causes "I changed the code but the artifact
@@ -883,8 +1108,14 @@ def build_existing_dproj(
         )
 
     cleaned_dirs: list[str] = []
+    rejected_dirs: list[str] = []
     if deep_clean:
-        cleaned_dirs = _deep_clean_platform_dirs(project_dir, platform, config)
+        cleaned_dirs = _deep_clean_platform_dirs(
+            project_dir, platform, config, dproj_paths=dproj_paths
+        )
+        rejected_dirs = getattr(
+            _deep_clean_platform_dirs, "_last_rejected", []
+        )
 
     # If the requested target was "Clean", we've already done the meaningful
     # work via deep_clean; still invoke MSBuild Clean for symmetry so the
@@ -940,7 +1171,13 @@ def build_existing_dproj(
     success = proc.returncode == 0
     exe_path: str | None = None
     if success:
-        exe_path = _resolve_artifact_path(project_dir, project_name, platform, config)
+        exe_path = _resolve_artifact_path(
+            project_dir,
+            project_name,
+            platform,
+            config,
+            exe_output_dir=dproj_paths.get("DCC_ExeOutput"),
+        )
 
     # Stitch any deep-clean record onto the front of stdout so the caller can
     # see what was wiped. Keeps a single channel for the human-readable trace.
@@ -953,6 +1190,20 @@ def build_existing_dproj(
         )
     elif deep_clean:
         clean_log = "Deep clean requested; no stale platform dirs found.\n\n"
+    if rejected_dirs:
+        clean_log += (
+            "Skipped (outside project tree — shared system dirs are never wiped):\n"
+            + "\n".join(f"  - {d}" for d in rejected_dirs)
+            + "\n\n"
+        )
+
+    # Surface the dproj's resolved output paths so the trace shows exactly
+    # which directories were targeted (helps debug when builds claim success
+    # but the user can't find the artifact).
+    dproj_log = ""
+    if dproj_paths:
+        rows = [f"  {k}: {v}" for k, v in dproj_paths.items()]
+        dproj_log = "Dproj output paths (resolved by MSBuild):\n" + "\n".join(rows) + "\n\n"
 
     # PAServer info: surface the profile used, and warn if the platform needs
     # one but none was passed (the .dproj may still have a default pinned).
@@ -972,7 +1223,7 @@ def build_existing_dproj(
     return CompileResult(
         success=success,
         exit_code=proc.returncode,
-        stdout=paserver_log + clean_log + (proc.stdout or ""),
+        stdout=paserver_log + dproj_log + clean_log + (proc.stdout or ""),
         stderr=proc.stderr,
         compiler_used=f"MSBuild ({platform} {config}) via {os.path.basename(studio_root)}",
         exe_path=exe_path,
