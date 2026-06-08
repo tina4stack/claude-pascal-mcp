@@ -87,7 +87,19 @@ mcp = FastMCP(
         "to capture the device screen. Use adb_tap, adb_swipe, adb_type_text, "
         "and adb_key for UI automation. Use adb_install, adb_launch_app, "
         "adb_stop_app for app management. Use adb_push and adb_pull for "
-        "file transfer. All ADB tools accept an optional device serial."
+        "file transfer. All ADB tools accept an optional device serial. "
+        "PASERVER & PACLIENT: for any work that talks to a remote Mac or "
+        "Linux host via PAServer (iOS/macOS/Linux builds, file transfer "
+        "to/from the remote host, iOS codesign / IPA / device install), "
+        "use the paserver_* and ios_* tools — NEVER shell out to paclient.exe "
+        "directly or roll your own SSH layer. paserver_check_connection "
+        "is the right pre-flight before any iOS/macOS/Linux operation. "
+        "list_remote_profiles enumerates the Connection Profiles registered "
+        "in HKCU. paserver_get / paserver_put / paserver_remove transfer "
+        "files (PAServer's restricted mode means writes go in the per-profile "
+        "scratch dir — paserver_scratch_dir composes it). After a build_dproj "
+        "for iOS leaves a .app in scratch, ios_codesign / ios_create_ipa / "
+        "ios_install_ipa wrap the codesign + IPA + device-install pipeline."
     ),
 )
 
@@ -133,6 +145,24 @@ async def get_compiler_info(ctx: Context) -> str:
         lines.append(f"    Version: {c.version}")
         lines.append(f"    Path:    {c.path}")
         lines.append("")
+
+    # PAClient detection — useful both as a signal to Claude that PAServer
+    # tooling is available, and as a diagnostic hint when the user reports
+    # PAServer-related issues. Best-effort; never block compiler info.
+    try:
+        from pascal_mcp.paclient import find_paclient
+        pc = find_paclient()
+        if pc:
+            lines.append("PAClient (PAServer driver):")
+            lines.append(f"    Path:    {pc}")
+            lines.append(
+                "    Tools:   paserver_check_connection, paserver_info, "
+                "paserver_get/put/remove, ios_codesign, ios_create_ipa, "
+                "ios_install_ipa, list_remote_profiles"
+            )
+            lines.append("")
+    except Exception:
+        pass
 
     return "\n".join(lines)
 
@@ -850,6 +880,149 @@ async def paserver_put(
     if pc is None:
         return "paclient.exe not found."
     r = do_put(pc, profile, local_path, remote_dir, timeout=timeout)
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n\n"
+    )
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
+async def ios_codesign(
+    profile: str,
+    app_path: str,
+    certificate: str,
+    entitlement: str | None = None,
+    notarize: bool = False,
+    timeout: int = 300,
+    studio_root: str | None = None,
+) -> str:
+    """Codesign an iOS/macOS .app bundle on the remote Mac (paclient -c).
+
+    The .app must already exist on the Mac (typically in PAServer's scratch
+    dir after build_dproj + Deploy ran). The certificate is whatever's in
+    the Mac's keychain — pass the common name (e.g. "iPhone Developer:
+    Jane Doe (ABCDE12345)") or "-" for ad-hoc dash-signing (development
+    use only; won't install on real devices). Notarization options need
+    Apple Developer Program membership + notarytool setup on the Mac.
+
+    Args:
+        profile: Connection Profile name.
+        app_path: Remote path to the .app bundle.
+        certificate: Identity in the Mac's keychain, or "-" for ad-hoc.
+        entitlement: Optional remote path to entitlements.plist.
+        notarize: Apply notarization (requires entitlement).
+        timeout: Seconds before killed.
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, ios_codesign as do_codesign
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_codesign(
+        pc, profile, app_path, certificate,
+        entitlement=entitlement, notarize=notarize, timeout=timeout,
+    )
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n"
+    )
+    if r.output_path:
+        head += f"signed: {r.output_path}\n"
+    head += "\n"
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
+async def ios_create_ipa(
+    profile: str,
+    app_path: str,
+    out_path: str,
+    certificate: str,
+    provisioning_profile: str,
+    ipa_type: int = 1,
+    timeout: int = 600,
+    studio_root: str | None = None,
+) -> str:
+    """Package a signed .app into an .ipa on the remote Mac (paclient -i).
+
+    The .app must be codesigned first (ios_codesign). The provisioning
+    profile must exist on the Mac and match the cert + bundle ID. IPA
+    assembly runs entirely on the Mac via xcrun.
+
+    Args:
+        profile: Connection Profile name.
+        app_path: Remote path to the signed .app.
+        out_path: Remote path where the .ipa should be written.
+        certificate: Same identity used for codesign.
+        provisioning_profile: Remote path to a .mobileprovision file.
+        ipa_type: 1 = ad-hoc / dev distribution, 2 = App Store. Default 1.
+        timeout: Seconds before killed (default 600).
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, ios_create_ipa as do_ipa
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_ipa(
+        pc, profile, app_path, out_path, certificate,
+        provisioning_profile, ipa_type=ipa_type, timeout=timeout,
+    )
+    head = (
+        f"profile: {r.profile}\noperation: {r.operation}\n"
+        f"success: {r.success}\n"
+    )
+    if r.output_path:
+        head += f"ipa: {r.output_path}\n"
+    head += "\n"
+    body = ""
+    if r.output:
+        body += "--- paclient output ---\n" + r.output.strip() + "\n"
+    if r.errors:
+        body += "--- paclient stderr ---\n" + r.errors.strip() + "\n"
+    return head + body
+
+
+@mcp.tool()
+async def ios_install_ipa(
+    profile: str,
+    ipa_path: str,
+    device_udid: str,
+    timeout: int = 300,
+    studio_root: str | None = None,
+) -> str:
+    """Install an .ipa on an iOS device attached to the Mac (paclient -ii).
+
+    The iOS device must be physically connected to the Mac, trusted, and
+    listed by xcrun devicectl. Find the UDID via `idevice_id -l` on the
+    Mac, or in Xcode → Window → Devices and Simulators.
+
+    Note: this is for *device* installation. Simulator installation needs
+    xcrun simctl install which paclient does NOT wrap — that's tracked
+    under issue #5 (sim_* tools).
+
+    Args:
+        profile: Connection Profile name.
+        ipa_path: Remote path to the .ipa on the Mac.
+        device_udid: Target iOS device UDID.
+        timeout: Seconds before killed.
+        studio_root: Optional Studio install root.
+    """
+    from pascal_mcp.paclient import find_paclient, ios_install_ipa as do_install
+    pc = find_paclient(studio_root)
+    if pc is None:
+        return "paclient.exe not found."
+    r = do_install(pc, profile, ipa_path, device_udid, timeout=timeout)
     head = (
         f"profile: {r.profile}\noperation: {r.operation}\n"
         f"success: {r.success}\n\n"

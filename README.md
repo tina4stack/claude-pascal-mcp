@@ -31,6 +31,15 @@ An MCP (Model Context Protocol) server that lets Claude compile, run, and intera
 | `parse_form` | Parse DFM/FMX/LFM form files |
 | `list_remote_profiles` | List PAServer Connection Profiles registered for iOS/macOS/Linux builds |
 | `check_ios_deploy` | Inspect a .dproj for the iOS DeployFile entries required by `/t:Deploy` |
+| `paserver_info` | Read local info about a PAServer Connection Profile (host/port/sysroot) |
+| `paserver_check_connection` | Two-stage reachability probe: registry validation + TCP socket connect |
+| `paserver_scratch_dir` | Compose PAServer's restricted-mode scratch dir for a profile |
+| `paserver_get` | Pull a file from the PAServer remote host |
+| `paserver_put` | Push a file to the PAServer remote host |
+| `paserver_remove` | Delete a file on the PAServer remote host |
+| `ios_codesign` | Codesign an .app bundle on the remote Mac (paclient -c) |
+| `ios_create_ipa` | Assemble a signed .app into an .ipa (paclient -i) |
+| `ios_install_ipa` | Install an .ipa on an iOS device attached to the Mac (paclient -ii) |
 | `screenshot_app` | Capture screenshot of a running app window |
 | `list_app_windows` | List visible windows on the desktop |
 | `app_click` | Click on a Windows app window at screenshot pixel coordinates |
@@ -83,6 +92,68 @@ If a build fails, walk through these before assuming the MCP is broken:
 - For iOSSimARM64: is the iPhone**Simulator** SDK imported in *Tools → Manage Platforms*? (Importing the iPhoneOS *device* SDK doesn't satisfy the simulator link — `ld: file not found: /usr/lib/libiconv.dylib`.)
 - For any PAServer platform: `list_remote_profiles()` shows what's registered; sidecar `.profile` files must exist at `%APPDATA%\Embarcadero\BDS\<ver>\<name>.profile` for `/t:Deploy` to read them.
 - For Android: is `adb` on PATH? Is the device authorized (`adb_devices`)?
+
+## PAServer & PAClient
+
+Cross-platform Embarcadero builds (iOS, macOS, Linux) compile through PAServer on a remote Mac or Linux host, driven by `paclient.exe` on Windows. This MCP wraps both ends:
+
+- `build_dproj` for iOS/macOS/Linux auto-resolves a Connection Profile, chains `/t:Deploy`, and synthesizes the iOS manifest if needed (see [§build_dproj details](#build_dproj-details)).
+- `paserver_*` tools cover the direct file/transfer/diagnostic surface that MSBuild doesn't reach.
+- `ios_*` tools wrap the iOS-bundle pipeline (codesign → IPA → device install) for cases where you want surgical control instead of a full Deploy.
+
+### Connection Profiles
+
+PAServer profiles live in `HKCU\Software\Embarcadero\BDS\<ver>\RemoteProfiles\` (registry) with a sidecar at `%APPDATA%\Embarcadero\BDS\<ver>\<name>.profile`. Configure them via **RAD Studio → Tools → Options → Environment Options → Connection Profile Manager**.
+
+```bash
+# What's registered:
+list_remote_profiles()
+# Verify a specific one's reachable:
+paserver_check_connection("MACBOOK", timeout=3.0)
+```
+
+### Restricted mode
+
+By default PAServer rejects any file op outside its per-profile scratch dir:
+
+```
+/Users/<remote_user>/PAServer/scratch-dir/<windows_user>-<PROFILE>/
+```
+
+Targeting `/tmp` or `/Users/anything-else` returns `Error: E0006 ... PAServer is running in restricted mode`. Either point your transfer at the scratch dir (`paserver_scratch_dir` composes the path) or have the host operator start PAServer with `-restricted=false`.
+
+### Full iOS deploy recipe
+
+```python
+# 1. Build the iOS app — Deploy chain leaves a .app in the scratch dir
+build_dproj(
+    r"D:\src\App.dproj",
+    config="Release",
+    platform="iOSDevice64",
+    synthesize_ios_manifest=True,  # if this is the first iOS deploy
+)
+
+# 2. Codesign it (or skip with "-" for ad-hoc dev signing)
+ios_codesign(
+    "MACBOOK",
+    "/Users/macuser/PAServer/scratch-dir/winuser-MACBOOK/App.app",
+    "iPhone Developer: Jane Doe (ABCDE12345)",
+    entitlement="/Users/macuser/Provisioning/App.entitlements",
+)
+
+# 3. Package as IPA
+ios_create_ipa(
+    "MACBOOK",
+    app_path="/Users/.../App.app",
+    out_path="/Users/.../App.ipa",
+    certificate="iPhone Developer: ...",
+    provisioning_profile="/Users/.../App.mobileprovision",
+    ipa_type=1,  # ad-hoc; 2 for App Store
+)
+
+# 4. Install on attached device (find UDID via xcrun devicectl)
+ios_install_ipa("MACBOOK", "/Users/.../App.ipa", "00008101-001234567890123A")
+```
 
 ## Preview Bridge
 

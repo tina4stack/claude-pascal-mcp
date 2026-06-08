@@ -408,6 +408,207 @@ def paserver_put(
     )
 
 
+@dataclass
+class IOSPipelineResult:
+    """Outcome of an iOS bundle operation (codesign, IPA build, install)."""
+    success: bool
+    profile: str
+    operation: str
+    output_path: str | None  # for create_ipa: where the IPA was written
+    output: str
+    errors: str
+
+
+def ios_codesign(
+    paclient: str,
+    profile: str,
+    app_path: str,
+    certificate: str,
+    entitlement: str | None = None,
+    notarize: bool = False,
+    timeout: int = 300,
+) -> IOSPipelineResult:
+    """Codesign an iOS/macOS .app bundle on the remote Mac.
+
+    Wraps `paclient -c <path>,<cert>[,<entitlement> [,1]]`. The .app must
+    already exist on the Mac (typically in the PAServer scratch dir after
+    a Build+Deploy chain has run). The certificate is whatever's in the
+    Mac's keychain — pass the cert's common name, or "-" for ad-hoc
+    dash-signing (development only, won't install on real devices).
+
+    Args:
+        paclient: Path to paclient.exe (use find_paclient()).
+        profile: Connection Profile name.
+        app_path: Remote path to the .app bundle (e.g. /Users/.../scratch-dir/.../MyApp.app).
+        certificate: Identity in the Mac's keychain. Pass "-" for ad-hoc.
+        entitlement: Optional path to entitlements.plist on the remote Mac.
+        notarize: If True, applies notarization options (the trailing "1"
+            in paclient's -c syntax). Requires Apple Developer Program
+            membership and notarization staging set up on the Mac.
+        timeout: Seconds before the operation is killed.
+    """
+    info = get_paserver_info(paclient, profile)
+    if info is None:
+        return IOSPipelineResult(
+            False, profile, "codesign", None, "",
+            f"Profile {profile!r} not found",
+        )
+
+    codesign_arg = f"{app_path},{certificate}"
+    if entitlement:
+        codesign_arg += f",{entitlement}"
+        if notarize:
+            codesign_arg += ",1"
+    elif notarize:
+        # paclient's -c syntax requires entitlement to be present before the
+        # notarize flag. Without it, just skip the notarize bit and tell
+        # the caller.
+        pass
+
+    args = [
+        *_paclient_conn_args(info),
+        f"--codesign={codesign_arg}",
+        profile,
+    ]
+    try:
+        proc = _run_paclient(paclient, args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return IOSPipelineResult(
+            False, profile, "codesign", None, "",
+            f"paclient -c timed out after {timeout}s",
+        )
+    return IOSPipelineResult(
+        success=proc.returncode == 0,
+        profile=profile, operation="codesign",
+        output_path=app_path if proc.returncode == 0 else None,
+        output=proc.stdout or "", errors=proc.stderr or "",
+    )
+
+
+def ios_create_ipa(
+    paclient: str,
+    profile: str,
+    app_path: str,
+    out_path: str,
+    certificate: str,
+    provisioning_profile: str,
+    ipa_type: int = 1,
+    timeout: int = 600,
+) -> IOSPipelineResult:
+    """Package a signed .app into an .ipa for distribution.
+
+    Wraps `paclient -i <path>,<outpath>,<cert>,<profile>,<type>` where
+    type=1 is ad-hoc (TestFlight, development device install) and type=2
+    is app-store (App Store Connect upload).
+
+    The .app must be codesigned first (call ios_codesign). The
+    provisioning_profile is the path on the Mac to a .mobileprovision
+    file matching the cert + bundle ID. IPA assembly runs entirely on
+    the remote Mac via xcrun.
+
+    Args:
+        paclient: Path to paclient.exe.
+        profile: Connection Profile name.
+        app_path: Remote path to the signed .app.
+        out_path: Remote path where the .ipa should be written.
+        certificate: Same identity used for codesign.
+        provisioning_profile: Remote path to the .mobileprovision file.
+        ipa_type: 1 for ad-hoc / dev, 2 for app-store. Default 1.
+        timeout: Seconds before killed (default 600 — IPA assembly is slow).
+    """
+    if ipa_type not in (1, 2):
+        return IOSPipelineResult(
+            False, profile, "create_ipa", None, "",
+            f"ipa_type must be 1 (ad-hoc) or 2 (app-store), got {ipa_type}",
+        )
+
+    info = get_paserver_info(paclient, profile)
+    if info is None:
+        return IOSPipelineResult(
+            False, profile, "create_ipa", None, "",
+            f"Profile {profile!r} not found",
+        )
+
+    ipa_arg = (
+        f"{app_path},{out_path},{certificate},"
+        f"{provisioning_profile},{ipa_type}"
+    )
+    args = [
+        *_paclient_conn_args(info),
+        f"--ipa={ipa_arg}",
+        profile,
+    ]
+    try:
+        proc = _run_paclient(paclient, args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return IOSPipelineResult(
+            False, profile, "create_ipa", None, "",
+            f"paclient -i timed out after {timeout}s",
+        )
+    return IOSPipelineResult(
+        success=proc.returncode == 0,
+        profile=profile, operation="create_ipa",
+        output_path=out_path if proc.returncode == 0 else None,
+        output=proc.stdout or "", errors=proc.stderr or "",
+    )
+
+
+def ios_install_ipa(
+    paclient: str,
+    profile: str,
+    ipa_path: str,
+    device_udid: str,
+    timeout: int = 300,
+) -> IOSPipelineResult:
+    """Install an .ipa onto an iOS device attached to the remote Mac.
+
+    Wraps `paclient -ii <path>,<deviceid>`. The iOS device must be:
+      * Physically connected to the Mac (USB or via Wi-Fi pairing)
+      * Trusted (the device's "Trust this computer" dialog has been
+        accepted)
+      * Listed in xcrun devicectl / Xcode's Devices and Simulators
+
+    The UDID is the iOS device identifier. Find it with `idevice_id -l`
+    or in Xcode → Window → Devices and Simulators.
+
+    Note: this is for *device* installation, not Simulator. Simulator
+    install uses xcrun simctl install which paclient doesn't wrap —
+    that's still ahead in issue #5 (sim_* tools).
+
+    Args:
+        paclient: Path to paclient.exe.
+        profile: Connection Profile name.
+        ipa_path: Remote path to the .ipa on the Mac.
+        device_udid: Target iOS device UDID.
+        timeout: Seconds before killed.
+    """
+    info = get_paserver_info(paclient, profile)
+    if info is None:
+        return IOSPipelineResult(
+            False, profile, "install_ipa", None, "",
+            f"Profile {profile!r} not found",
+        )
+
+    args = [
+        *_paclient_conn_args(info),
+        f"--installipa={ipa_path},{device_udid}",
+        profile,
+    ]
+    try:
+        proc = _run_paclient(paclient, args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return IOSPipelineResult(
+            False, profile, "install_ipa", None, "",
+            f"paclient -ii timed out after {timeout}s",
+        )
+    return IOSPipelineResult(
+        success=proc.returncode == 0,
+        profile=profile, operation="install_ipa",
+        output_path=None,
+        output=proc.stdout or "", errors=proc.stderr or "",
+    )
+
+
 def paserver_remove(
     paclient: str,
     profile: str,
