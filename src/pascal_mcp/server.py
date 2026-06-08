@@ -23,6 +23,7 @@ from pascal_mcp.compiler import (
 )
 from pascal_mcp.templates import (
     generate_console_project,
+    generate_fmx_project,
     generate_fpc_project,
     generate_vcl_project,
 )
@@ -396,7 +397,15 @@ async def compile_delphi_project(
         compiler: Which compiler to use ('fpc', 'dcc32', 'dcc64', or full path).
         output_dir: Optional directory for output files. If not specified,
             uses a temp directory.
-        project_type: 'vcl' for GUI app, 'console' for console app, 'fpc' for FPC.
+        project_type: One of:
+            'vcl'     — Windows-only desktop GUI app (Vcl.Forms, .dfm).
+            'fmx'     — FireMonkey cross-platform GUI app (FMX.Forms, .fmx).
+                        Emits a .dproj wired for Win32 + Win64 + Android64
+                        so build_dproj can cross-compile to mobile without
+                        manual editing. Use this when the user wants
+                        Android/iOS/macOS, or just "a mobile-ready app".
+            'console' — text-mode program (no form).
+            'fpc'     — Free Pascal program (cross-platform but no GUI).
         program_body: For console/fpc projects, the main program code.
     """
     import json
@@ -420,6 +429,18 @@ async def compile_delphi_project(
             events=evt_list,
             compiler_type=compiler,
         )
+    elif project_type == "fmx":
+        # FMX gets a full .dproj alongside the .dpr/.pas/.fmx so build_dproj
+        # can cross-compile to Android out of the box. The dproj targets
+        # Win32/Win64/Android64; iOS/macOS can be added in RAD Studio later
+        # (they need PAServer setup and the deploy-manifest synthesizer).
+        files = generate_fmx_project(
+            project_name=project_name,
+            form_caption=form_caption,
+            components=comp_list,
+            events=evt_list,
+            compiler_type=compiler,
+        )
     elif project_type == "console":
         body = program_body or "    Writeln('Hello, World!');"
         files = generate_console_project(
@@ -434,7 +455,11 @@ async def compile_delphi_project(
             program_body=body,
         )
     else:
-        return f"Unknown project_type: {project_type}. Use 'vcl', 'console', or 'fpc'."
+        return (
+            f"Unknown project_type: {project_type}. "
+            "Use 'vcl' (Windows desktop), 'fmx' (cross-platform incl. mobile), "
+            "'console' (text-mode), or 'fpc' (Free Pascal)."
+        )
 
     # Show what was generated
     parts = [f"Generated {len(files)} file(s):"]
