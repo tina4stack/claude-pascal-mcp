@@ -19,31 +19,78 @@ from pascal_mcp.screenshot import (
 )
 
 
-# Patterns to match IDE window titles
+# Window class names — primary discriminator. Title-based matching catches
+# every Edge tab whose page title happens to mention "RAD Studio", which
+# is awkward but harmless until you try to screenshot it.
+#
+# IMPORTANT: TApplication is intentionally NOT here — it's the main-window
+# class of every Delphi-built VCL app (MobaXterm, dozens of others), not
+# specific to the IDE itself. Modern RAD Studio uses TAppBuilder.
+IDE_WINDOW_CLASSES = {
+    "TAppBuilder",     # RAD Studio 11 / 12 / 13
+    "TMainIDEMain",    # Some Delphi 7 builds
+    "TLazarusIDE",     # Lazarus main IDE window
+}
+
+# Title-only fallback patterns (used when no TAppBuilder is found,
+# typically because the IDE is on a different desktop or hidden).
 IDE_TITLE_PATTERNS = [
-    r"Embarcadero RAD Studio",
-    r"RAD Studio",
-    r"Delphi \d",
-    r"Lazarus IDE",
-    r"Lazarus v",
+    r"Embarcadero RAD Studio \d",  # "Embarcadero RAD Studio 12.x ..."
+    r"RAD Studio \d",              # "RAD Studio 13 - ..."
+    r"Delphi \d - ",               # "Delphi 7 - ProjectName"
+    r"Lazarus IDE v",
 ]
 
 
+def _get_window_class(hwnd: int) -> str:
+    """Return the Win32 class name of a window (empty string on failure)."""
+    import ctypes
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(int(hwnd), buf, 256)
+    return buf.value
+
+
 def find_ide_window() -> dict | None:
-    """Find a running Delphi/Lazarus IDE window.
+    """Find a running Delphi / Lazarus IDE window.
+
+    Looks for a window with class TAppBuilder / TMainIDE first — that's
+    how Windows itself distinguishes the real IDE from any browser tab
+    whose title happens to mention "RAD Studio". Falls back to tightened
+    title patterns (e.g. ``RAD Studio 13 - ``) only if no class match is
+    found, which covers older Lazarus and edge cases where window
+    enumeration misses the main HWND.
 
     Returns dict with hwnd, title, and parsed project_name, or None.
     """
     windows = list_windows("")
+
+    # Pass 1: match by class (the right discriminator)
+    for w in windows:
+        try:
+            cls = _get_window_class(w["hwnd"])
+        except Exception:
+            continue
+        if cls in IDE_WINDOW_CLASSES:
+            return {
+                "hwnd": w["hwnd"],
+                "title": w["title"],
+                "project_name": _parse_project_name(w["title"]),
+                "class_name": cls,
+            }
+
+    # Pass 2: title-based fallback. Only matches if the title clearly
+    # belongs to an IDE (e.g. "RAD Studio 13 - " with a version digit
+    # and trailing dash), so Edge tabs showing the RAD Studio docwiki
+    # don't false-positive.
     for w in windows:
         title = w["title"]
         for pattern in IDE_TITLE_PATTERNS:
             if re.search(pattern, title, re.IGNORECASE):
-                project_name = _parse_project_name(title)
                 return {
                     "hwnd": w["hwnd"],
                     "title": title,
-                    "project_name": project_name,
+                    "project_name": _parse_project_name(title),
+                    "class_name": None,
                 }
     return None
 
@@ -63,8 +110,59 @@ def _parse_project_name(title: str) -> str | None:
 
 
 def capture_ide_screenshot(hwnd: int):
-    """Capture the IDE window and return a PIL Image."""
-    return _capture_with_printwindow(hwnd)
+    """Capture the IDE window and return a PIL Image, or None on failure.
+
+    RAD Studio 11+ renders its code editor, structure pane, and other
+    central panels via Skia on a GPU-composited layer that PrintWindow
+    can't reach — it returns a valid bitmap that's almost entirely black.
+    We work around it in three stages:
+
+      1. Restore + foreground the window (no-op if it's already there).
+         GPU compositing only updates the visible window, so this is the
+         precondition for any capture method working at all.
+      2. Try PrintWindow first — when it does work (older Delphi /
+         Lazarus, non-Skia panels), it gives the cleanest result
+         independent of overlapping windows.
+      3. Detect the all-black failure mode and fall back to a desktop-DC
+         screen crop. The crop picks up whatever's actually under the
+         IDE's window rect, which on a foreground window is the IDE.
+
+    Returns None only if both paths fail (e.g. the window vanished or
+    has zero area).
+    """
+    # Lazy imports — these are Windows-only paths the module's top-level
+    # imports may not provide on non-Windows hosts.
+    from pascal_mcp.screenshot import (
+        _bring_window_to_front,
+        _capture_via_screen_crop,
+        _is_mostly_black,
+    )
+    import time
+
+    try:
+        _bring_window_to_front(hwnd)
+    except Exception:
+        # If we can't foreground it the screen-crop path is doomed,
+        # but PrintWindow might still squeeze something out — push on.
+        pass
+
+    # Tiny pause for the compositor to redraw the window now that it's
+    # foreground. 200ms is enough for the IDE on a modern box but doesn't
+    # add user-visible latency.
+    time.sleep(0.2)
+
+    img = _capture_with_printwindow(hwnd)
+    if img is not None and not _is_mostly_black(img):
+        return img
+
+    # PrintWindow either returned nothing or returned all black — fall back.
+    fallback = _capture_via_screen_crop(hwnd)
+    if fallback is not None:
+        return fallback
+
+    # Last resort: return whatever PrintWindow gave us, even if it's
+    # black, so the caller gets *something* and a clearer error message.
+    return img
 
 
 def find_project_files(project_dir: str) -> dict:

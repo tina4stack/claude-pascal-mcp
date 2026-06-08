@@ -278,6 +278,114 @@ def list_windows(filter_text: str = "") -> list[dict[str, str]]:
     return windows
 
 
+def _capture_via_screen_crop(hwnd: int) -> Image.Image | None:
+    """Capture a window by BitBlt'ing the screen region under its rect.
+
+    PrintWindow misses GPU-composited content — RAD Studio's Skia-rendered
+    code editor and structure panes return as black pixels because they
+    live in a layer the window manager can't redraw on demand. The
+    desktop DC has the real pixels though, so we just copy them.
+
+    Requires the window to actually be visible on screen — call
+    _bring_window_to_front first if it might be minimized or behind
+    other windows. Will silently pick up any other windows overlapping
+    the IDE's rectangle, which is the price of using the desktop DC.
+    """
+    rect = ctypes.wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return None
+
+    desktop_dc = ctypes.windll.user32.GetDC(0)
+    if not desktop_dc:
+        return None
+
+    try:
+        mem_dc = ctypes.windll.gdi32.CreateCompatibleDC(desktop_dc)
+        if not mem_dc:
+            return None
+        try:
+            bitmap = ctypes.windll.gdi32.CreateCompatibleBitmap(
+                desktop_dc, width, height,
+            )
+            if not bitmap:
+                return None
+            try:
+                ctypes.windll.gdi32.SelectObject(mem_dc, bitmap)
+                SRCCOPY = 0x00CC0020
+                ok = ctypes.windll.gdi32.BitBlt(
+                    mem_dc, 0, 0, width, height,
+                    desktop_dc, rect.left, rect.top, SRCCOPY,
+                )
+                if not ok:
+                    return None
+
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ("biSize", ctypes.c_uint32),
+                        ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32),
+                        ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16),
+                        ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32),
+                        ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32),
+                        ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32),
+                    ]
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = width
+                bmi.biHeight = -height  # top-down DIB
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0  # BI_RGB
+
+                buf = ctypes.create_string_buffer(width * height * 4)
+                ctypes.windll.gdi32.GetDIBits(
+                    mem_dc, bitmap, 0, height,
+                    buf, ctypes.byref(bmi), 0,
+                )
+                img = Image.frombuffer(
+                    "RGBA", (width, height), buf, "raw", "BGRA", 0, 1,
+                )
+                return img.convert("RGB")
+            finally:
+                ctypes.windll.gdi32.DeleteObject(bitmap)
+        finally:
+            ctypes.windll.gdi32.DeleteDC(mem_dc)
+    finally:
+        ctypes.windll.user32.ReleaseDC(0, desktop_dc)
+
+
+def _is_mostly_black(img: Image.Image, threshold: float = 0.95) -> bool:
+    """Heuristic: is the image >= threshold fraction near-black pixels?
+
+    PrintWindow's failure mode on Skia-rendered windows isn't a None return
+    — it returns a valid bitmap that's almost entirely black because the
+    GPU layer wasn't captured. Sample the centre 100x100 region (cheap)
+    and call it "failed" if nearly every pixel is near-black.
+    """
+    w, h = img.size
+    if w == 0 or h == 0:
+        return True
+    sample_size = 100
+    x0 = max(0, (w - sample_size) // 2)
+    y0 = max(0, (h - sample_size) // 2)
+    x1 = min(w, x0 + sample_size)
+    y1 = min(h, y0 + sample_size)
+    sample = img.crop((x0, y0, x1, y1))
+    sample_rgb = sample.convert("RGB").getdata()
+    near_black = sum(1 for r, g, b in sample_rgb if r < 16 and g < 16 and b < 16)
+    total = (x1 - x0) * (y1 - y0)
+    return total > 0 and (near_black / total) >= threshold
+
+
 def capture_window(
     title: str,
     bring_to_front: bool = False,
