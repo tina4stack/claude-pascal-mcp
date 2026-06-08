@@ -40,7 +40,7 @@ from pascal_mcp.adb import (
     get_device_info,
     install_apk,
     key_event,
-    launch_app,
+    launch_app as _adb_launch_app_impl,
     list_devices,
     list_packages,
     pull_file,
@@ -1223,7 +1223,7 @@ async def adb_launch_app(
             only one device is connected.
     """
     try:
-        return launch_app(package, activity=activity, device=device)
+        return _adb_launch_app_impl(package, activity=activity, device=device)
     except RuntimeError as e:
         return str(e)
 
